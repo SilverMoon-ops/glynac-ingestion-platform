@@ -61,10 +61,38 @@ def sign(secret: str, body: bytes):
     return {"X-Timestamp": ts, "X-Signature": sig}
 ```
 
+## Day 1 — Salesforce Bulk API v2 (done)
+
+- `app/salesforce/schemas.py` — a **distinct schema per object** (Accounts,
+  Contacts, Opportunities, Leads, Tasks, Cases, Products, PricebookEntries,
+  Contracts, Assets) instead of one flat 6-field shape for all 10.
+- `app/salesforce/mock_client.py` — simulates OAuth2 auth + the real Bulk
+  API v2 job lifecycle (Create Job → poll Get Job Status → Get Job Results),
+  with deterministic failure/corruption injection so tests aren't flaky.
+- `app/salesforce/ingest.py` — the orchestrator: every external call goes
+  through `with_retry`, every stage calls `update_checkpoint` (so a crash
+  mid-run resumes from the last completed stage), bad records go to the
+  `DeadLetter` table instead of vanishing.
+- `app/routers/salesforce.py` — `start / status / pause / resume / cancel /
+  list / remove`, a MinIO file browser endpoint, and a ClickHouse inspect
+  endpoint.
+- `app/static/index.html` — the web monitoring console (served at `/ui/`):
+  trigger a sync, watch jobs update live with status badges, pause/resume/
+  cancel/remove, browse landed files. Auth is real — you type the HMAC
+  secret into the page and it signs every request client-side.
+- `app/storage.py` / `app/clickhouse_sink.py` — pluggable backends: local
+  filesystem + in-memory ClickHouse by default (zero setup, what the tests
+  use), or real MinIO + ClickHouse once `docker compose up -d` is running
+  (flip `STORAGE_BACKEND=minio` and `CLICKHOUSE_ENABLED=true` in `.env`).
+
+Try it: `uvicorn app.main:app --reload`, open `http://localhost:8000/ui/`,
+paste your `HMAC_SECRET` from `.env`, pick an object, hit **Trigger Bulk
+Sync**.
+
 ## Roadmap
 
-- [x] Day 0 — this scaffold (job state machine, auth, retry, audit, tests)
-- [ ] Day 1 — Salesforce Bulk API v2 service + UI (`app/routers/salesforce.py`)
+- [x] Day 0 — shared scaffold (job state machine, auth, retry, audit, tests)
+- [x] Day 1 — Salesforce Bulk API v2 service + UI
 - [ ] Day 2 — HubSpot `dlt` pipeline wired into the API (`app/routers/hubspot.py`)
 - [ ] Day 3 — Slack dual-mode ingestion (`app/routers/slack.py`)
 - [ ] Day 4 — polish, HMAC audit pass, crash-recovery demo, video

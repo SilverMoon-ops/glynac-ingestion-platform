@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Glynac Ingestion Console</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #10151b;
+    --surface: #171e27;
+    --surface-raised: #1d2530;
+    --border: #2a333d;
+    --text: #e6edf3;
+    --text-muted: #8b96a5;
+    --accent: #4fb8ae;
+    --accent-dim: #35544f;
+    --pending: #8b96a5;
+    --running: #4fb8ae;
+    --paused: #d9a441;
+    --completed: #5fbf77;
+    --failed: #e0605a;
+    --cancelled: #6b7684;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'IBM Plex Sans', sans-serif;
+    font-size: 14px;
+    line-height: 1.5;
+  }
+  .mono { font-family: 'IBM Plex Mono', monospace; }
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 14px 20px;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
+  }
+  header h1 {
+    font-size: 15px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    margin: 0;
+  }
+  header .creds { display: flex; gap: 10px; align-items: center; }
+  input {
+    background: var(--surface-raised);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 4px;
+    padding: 6px 8px;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 12px;
+  }
+  input::placeholder { color: var(--text-muted); }
+  main {
+    max-width: 1100px;
+    margin: 0 auto;
+    padding: 20px;
+    display: grid;
+    grid-template-columns: 280px 1fr;
+    gap: 20px;
+  }
+  @media (max-width: 780px) {
+    main { grid-template-columns: 1fr; }
+  }
+  section {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 16px;
+  }
+  section h2 {
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-muted);
+    margin: 0 0 12px 0;
+    font-weight: 500;
+  }
+  .full-width { grid-column: 1 / -1; }
+  select {
+    width: 100%;
+    background: var(--surface-raised);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 4px;
+    padding: 8px;
+    margin-bottom: 10px;
+    font-size: 13px;
+  }
+  button {
+    width: 100%;
+    background: var(--accent);
+    color: #06201d;
+    border: none;
+    border-radius: 4px;
+    padding: 9px;
+    font-weight: 600;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  button:hover { filter: brightness(1.08); }
+  button.ghost {
+    width: auto;
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text-muted);
+    font-weight: 500;
+    padding: 4px 9px;
+    font-size: 11px;
+    margin-right: 4px;
+  }
+  button.ghost:hover { color: var(--text); border-color: var(--accent-dim); }
+  button.danger:hover { color: var(--failed); border-color: var(--failed); }
+  table { width: 100%; border-collapse: collapse; }
+  th {
+    text-align: left;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-muted);
+    font-weight: 500;
+    padding: 8px 6px;
+    border-bottom: 1px solid var(--border);
+  }
+  td {
+    padding: 8px 6px;
+    border-bottom: 1px solid var(--border);
+    font-size: 12.5px;
+    vertical-align: middle;
+  }
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-size: 11px;
+    font-weight: 500;
+    font-family: 'IBM Plex Mono', monospace;
+  }
+  .badge::before {
+    content: "";
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: currentColor;
+  }
+  .badge.PENDING   { color: var(--pending);   background: rgba(139,150,165,0.12); }
+  .badge.RUNNING   { color: var(--running);   background: rgba(79,184,174,0.14); }
+  .badge.PAUSED    { color: var(--paused);    background: rgba(217,164,65,0.14); }
+  .badge.COMPLETED { color: var(--completed); background: rgba(95,191,119,0.14); }
+  .badge.FAILED    { color: var(--failed);    background: rgba(224,96,90,0.14); }
+  .badge.CANCELLED { color: var(--cancelled); background: rgba(107,118,132,0.14); }
+  .empty { color: var(--text-muted); font-size: 12.5px; padding: 10px 0; }
+  .files-list { max-height: 220px; overflow-y: auto; }
+  .files-list div {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 12px;
+    color: var(--text-muted);
+    padding: 4px 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .live-dot {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--running); display: inline-block; margin-right: 6px;
+    animation: pulse 1.6s ease-in-out infinite;
+  }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
+  .status-line { color: var(--text-muted); font-size: 12px; margin-top: 8px; min-height: 16px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>GLYNAC &middot; INGESTION CONSOLE</h1>
+  <div class="creds">
+    <input id="secret" type="password" placeholder="HMAC secret" size="18" />
+    <input id="orgId" type="text" placeholder="org id" value="org1" size="8" />
+  </div>
+</header>
+
+<main>
+  <section>
+    <h2>Trigger Sync</h2>
+    <select id="objectSelect"><option>Loading objects…</option></select>
+    <button id="runBtn">Trigger Bulk Sync</button>
+    <div class="status-line" id="triggerStatus"></div>
+  </section>
+
+  <section>
+    <h2><span class="live-dot"></span>Salesforce Jobs</h2>
+    <table>
+      <thead>
+        <tr><th>Object</th><th>Status</th><th>Rows</th><th>Retries</th><th>Updated</th><th>Actions</th></tr>
+      </thead>
+      <tbody id="jobsBody"></tbody>
+    </table>
+    <div class="empty" id="jobsEmpty" style="display:none;">No jobs yet — trigger a sync to get started.</div>
+  </section>
+
+  <section class="full-width">
+    <h2>MinIO File Browser</h2>
+    <div class="files-list" id="filesList"><div class="empty">No files landed yet.</div></div>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+async function hmacSign(secret, message) {
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    "raw", enc.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]
+  );
+  const sig = await crypto.subtle.sign("HMAC", key, enc.encode(message));
+  return Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function signedFetch(path, options = {}) {
+  const secret = $("secret").value || "";
+  const body = options.body || "";
+  const ts = Math.floor(Date.now() / 1000).toString();
+  const sig = await hmacSign(secret, ts + body);
+  const headers = Object.assign(
+    { "Content-Type": "application/json" },
+    options.headers || {},
+    { "X-Timestamp": ts, "X-Signature": sig }
+  );
+  return fetch(path, Object.assign({}, options, { headers }));
+}
+
+function badge(status) {
+  return `<span class="badge ${status}">${status}</span>`;
+}
+
+async function loadObjects() {
+  const res = await signedFetch("/api/salesforce/objects");
+  if (!res.ok) return;
+  const data = await res.json();
+  const sel = $("objectSelect");
+  sel.innerHTML = data.objects.map(o => `<option value="${o}">${o}</option>`).join("");
+}
+
+async function triggerSync() {
+  const objectName = $("objectSelect").value;
+  const orgId = $("orgId").value || "org1";
+  $("triggerStatus").textContent = "Starting…";
+  const res = await signedFetch("/api/salesforce/start", {
+    method: "POST",
+    body: JSON.stringify({ object_name: objectName, org_id: orgId }),
+  });
+  if (res.ok) {
+    const job = await res.json();
+    $("triggerStatus").textContent = `Job ${job.id.slice(0, 8)} started.`;
+    refreshJobs();
+    refreshFiles();
+  } else {
+    const err = await res.json().catch(() => ({}));
+    $("triggerStatus").textContent = `Error: ${err.detail || res.status}`;
+  }
+}
+
+async function jobAction(jobId, action) {
+  const method = action === "remove" ? "DELETE" : "POST";
+  const path = `/api/salesforce/${action}/${jobId}`;
+  await signedFetch(path, { method });
+  refreshJobs();
+  refreshFiles();
+}
+
+function actionButtons(job) {
+  const buttons = [];
+  if (job.status === "RUNNING") buttons.push(["pause", "Pause"]);
+  if (job.status === "PAUSED" || job.status === "FAILED") buttons.push(["resume", "Resume"]);
+  if (job.status !== "COMPLETED" && job.status !== "CANCELLED") buttons.push(["cancel", "Cancel"]);
+  buttons.push(["remove", "Remove"]);
+  return buttons
+    .map(([action, label]) => `<button class="ghost ${action === "remove" ? "danger" : ""}" onclick="jobAction('${job.id}','${action}')">${label}</button>`)
+    .join("");
+}
+
+async function refreshJobs() {
+  const res = await signedFetch("/api/salesforce/list");
+  if (!res.ok) return;
+  const jobs = await res.json();
+  const body = $("jobsBody");
+  $("jobsEmpty").style.display = jobs.length ? "none" : "block";
+  body.innerHTML = jobs.map(job => `
+    <tr>
+      <td>${job.object_name || "-"}<div class="mono" style="color:var(--text-muted);font-size:10.5px;">${job.id.slice(0, 8)}</div></td>
+      <td>${badge(job.status)}</td>
+      <td class="mono">${job.row_count}</td>
+      <td class="mono">${job.retry_count}</td>
+      <td class="mono" style="color:var(--text-muted);font-size:11px;">${new Date(job.updated_at).toLocaleTimeString()}</td>
+      <td>${actionButtons(job)}</td>
+    </tr>
+  `).join("");
+}
+
+async function refreshFiles() {
+  const res = await signedFetch("/api/salesforce/files");
+  if (!res.ok) return;
+  const data = await res.json();
+  const list = $("filesList");
+  if (!data.files.length) {
+    list.innerHTML = '<div class="empty">No files landed yet.</div>';
+    return;
+  }
+  list.innerHTML = data.files.map(f => `<div>${f}</div>`).join("");
+}
+
+$("runBtn").addEventListener("click", triggerSync);
+
+loadObjects();
+refreshJobs();
+refreshFiles();
+setInterval(refreshJobs, 3000);
+setInterval(refreshFiles, 5000);
+</script>
+</body>
+</html>
