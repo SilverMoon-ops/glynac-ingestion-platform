@@ -1,0 +1,41 @@
+version: "3.8"
+
+services:
+  minio:
+    image: minio/minio:latest
+    container_name: glynac-minio
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Web console
+    environment:
+      MINIO_ROOT_USER: glynac_admin
+      MINIO_ROOT_PASSWORD: glynac_secret_key
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    container_name: glynac-clickhouse
+    ports:
+      - "8123:8123"   # HTTP interface
+      - "9002:9000"   # Native TCP interface (remapped, 9000 is taken by MinIO)
+    environment:
+      CLICKHOUSE_USER: glynac
+      CLICKHOUSE_PASSWORD: glynac_secret
+      CLICKHOUSE_DB: glynac
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+
+volumes:
+  minio_data:
+  clickhouse_data:
