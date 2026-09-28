@@ -4,7 +4,7 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
 from app.database import init_db
-from app.routers import system, jobs, salesforce
+from app.routers import system, jobs, salesforce, hubspot
 
 app = FastAPI(
     title="Glynac Ingestion Platform",
@@ -21,8 +21,8 @@ def on_startup():
 app.include_router(system.router)
 app.include_router(jobs.router)
 app.include_router(salesforce.router)
+app.include_router(hubspot.router)
 
-# Day 2: app.include_router(hubspot.router)
 # Day 3: app.include_router(slack.router)
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")

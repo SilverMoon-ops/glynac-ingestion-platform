@@ -74,7 +74,7 @@ def sign(secret: str, body: bytes):
   mid-run resumes from the last completed stage), bad records go to the
   `DeadLetter` table instead of vanishing.
 - `app/routers/salesforce.py` — `start / status / pause / resume / cancel /
-  list / remove`, a MinIO file browser endpoint, and a ClickHouse inspect
+list / remove`, a MinIO file browser endpoint, and a ClickHouse inspect
   endpoint.
 - `app/static/index.html` — the web monitoring console (served at `/ui/`):
   trigger a sync, watch jobs update live with status badges, pause/resume/
@@ -89,10 +89,52 @@ Try it: `uvicorn app.main:app --reload`, open `http://localhost:8000/ui/`,
 paste your `HMAC_SECRET` from `.env`, pick an object, hit **Trigger Bulk
 Sync**.
 
+## Day 2 — HubSpot `dlt` pipeline (done)
+
+- `app/hubspot/mock_server.py` — real cursor-based pagination
+  (`paging.next.after`, same shape HubSpot's own API uses) and simulated
+  429 + Retry-After — "the spec's core requirement for this service."
+- `app/hubspot/pipeline.py` — the actual `dlt` usage: a `dlt.resource`
+  generator, run via `dlt.pipeline(...).run(...)`, called directly from a
+  FastAPI background task. Not a standalone script — there's no
+  `run_hubspot_sync.js`-style CLI entry point anywhere in this repo.
+- **Pause is real**, not just a status flip: the generator checks a
+  cooperative signal before every page fetch and exits early, checkpointing
+  the exact `after` cursor to resume from onto the job's DB row. Resume (or
+  a fresh worker recovering from a crash) re-invokes the same pipeline
+  starting from that cursor — proven in tests to land zero duplicate rows.
+- Parquet lands at `hubspot/{org_id}/{object}/*.parquet` via
+  `dlt.destinations.filesystem` (local disk by default, real MinIO once
+  `STORAGE_BACKEND=minio`).
+- ClickHouse tables use `ReplacingMergeTree` (dedups by `id` on merge) plus
+  a `v_..._latest` view using `FINAL`, so resumed/re-run loads stay
+  idempotent — the "curated analytical views" requirement.
+- `app/routers/hubspot.py` — `start / status / pause / resume / cancel /
+list / remove`, a Parquet file browser, a ClickHouse inspect endpoint.
+
+Try it: `POST /api/hubspot/start {"object_name": "Contacts", "org_id": "org1"}`,
+then `POST /api/hubspot/pause/{job_id}` while it's mid-run (needs a real
+`uvicorn` process, not the test client, to get genuine concurrency), then
+`GET /api/hubspot/status/{job_id}` to watch it land on `PAUSED`, then
+`POST /api/hubspot/resume/{job_id}`.
+
+**Trying pause yourself.** The default mock finishes in a fraction of a
+second. To leave time to click Pause, set in `.env`:
+`HUBSPOT_MOCK_LATENCY_SECONDS=0.4` and `HUBSPOT_MOCK_TOTAL_RECORDS=100`.
+Verified against a live server this way: paused at 30 of 100 rows, resumed
+from the saved cursor, finished with 100 rows and 100 distinct ids.
+
+**Note:** `dlt` normalizes dataset names to snake_case, so org `orgLive` lands
+under `hubspot/org_live/...`.
+
+**Note on the `Job` table:** this added an `org_id` column. If you have an
+existing `glynac.db` from Day 0/1, delete it (or add the column manually) —
+`init_db()` only creates missing tables, it doesn't migrate existing ones.
+
 ## Roadmap
 
 - [x] Day 0 — shared scaffold (job state machine, auth, retry, audit, tests)
 - [x] Day 1 — Salesforce Bulk API v2 service + UI
-- [ ] Day 2 — HubSpot `dlt` pipeline wired into the API (`app/routers/hubspot.py`)
+- [x] Day 2 — HubSpot `dlt` pipeline wired into the API
 - [ ] Day 3 — Slack dual-mode ingestion (`app/routers/slack.py`)
 - [ ] Day 4 — polish, HMAC audit pass, crash-recovery demo, video

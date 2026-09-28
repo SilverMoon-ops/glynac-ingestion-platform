@@ -18,12 +18,12 @@ _ALLOWED_TRANSITIONS = {
 }
 
 
-def create_job(db: Session, service: str, object_name: Optional[str] = None) -> Job:
-    job = Job(service=service, object_name=object_name, status=JobStatus.PENDING.value)
+def create_job(db: Session, service: str, object_name: Optional[str] = None, org_id: Optional[str] = "org1") -> Job:
+    job = Job(service=service, object_name=object_name, org_id=org_id, status=JobStatus.PENDING.value)
     db.add(job)
     db.commit()
     db.refresh(job)
-    log_audit(db, job.id, "CREATED", detail=f"service={service} object={object_name}")
+    log_audit(db, job.id, "CREATED", detail=f"service={service} object={object_name} org={org_id}")
     return job
 
 

@@ -8,6 +8,7 @@ class JobOut(BaseModel):
     id: str
     service: str
     object_name: Optional[str] = None
+    org_id: Optional[str] = None
     status: str
     cursor: Optional[str] = None
     row_count: int

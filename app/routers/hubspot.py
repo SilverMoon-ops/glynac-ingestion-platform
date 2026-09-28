@@ -1,0 +1,142 @@
+import json
+from typing import List, Optional
+
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from pydantic import BaseModel
+from sqlalchemy.orm import Session
+
+from app.database import get_db
+from app.security import require_signed_request
+from app.jobs import create_job, get_job_or_404, transition
+from app.models import Job, JobStatus
+from app.schemas import JobOut
+from app.storage import get_storage
+from app.clickhouse_sink import get_clickhouse_sink
+from app.hubspot.schemas import HUBSPOT_SCHEMAS
+from app.hubspot.ingest import run_hubspot_ingestion
+from app.hubspot.pipeline import signal_pause
+
+router = APIRouter(
+    prefix="/api/hubspot",
+    tags=["hubspot"],
+    dependencies=[Depends(require_signed_request)],
+)
+
+
+class StartIngestionRequest(BaseModel):
+    object_name: str
+    org_id: str = "org1"
+
+
+@router.get("/objects")
+def list_supported_objects():
+    return {"objects": sorted(HUBSPOT_SCHEMAS.keys())}
+
+
+@router.post("/start", response_model=JobOut)
+def start_ingestion(payload: StartIngestionRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    if payload.object_name not in HUBSPOT_SCHEMAS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported object '{payload.object_name}'. See /api/hubspot/objects.",
+        )
+    job = create_job(db, service="hubspot", object_name=payload.object_name, org_id=payload.org_id)
+    background_tasks.add_task(run_hubspot_ingestion, job.id, payload.object_name, payload.org_id)
+    return job
+
+
+@router.get("/list", response_model=List[JobOut])
+def list_hubspot_jobs(db: Session = Depends(get_db)):
+    return db.query(Job).filter(Job.service == "hubspot").order_by(Job.created_at.desc()).all()
+
+
+@router.get("/status/{job_id}", response_model=JobOut)
+def get_status(job_id: str, db: Session = Depends(get_db)):
+    return get_job_or_404(db, job_id)
+
+
+@router.post("/pause/{job_id}", response_model=JobOut)
+def pause_job(job_id: str, db: Session = Depends(get_db)):
+    """
+    HubSpot's headline requirement. This signals the running pipeline to stop
+    before its next page fetch — the job's status flips to PAUSED once the
+    background worker notices and checkpoints, which the caller observes by
+    polling GET /status/{job_id}.
+    """
+    job = get_job_or_404(db, job_id)
+    if job.status != JobStatus.RUNNING.value:
+        raise HTTPException(status_code=409, detail=f"Job is {job.status}, not RUNNING — nothing to pause.")
+    signal_pause(job_id)
+    return job
+
+
+@router.post("/resume/{job_id}", response_model=JobOut)
+def resume_job(job_id: str, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    """
+    Re-launches ingestion starting from the job's last checkpointed cursor —
+    used both for a deliberate pause and for recovering a crashed run, since
+    both leave the same kind of checkpoint behind.
+    """
+    job = get_job_or_404(db, job_id)
+    if job.status not in (JobStatus.PAUSED.value, JobStatus.FAILED.value):
+        raise HTTPException(status_code=409, detail=f"Job is {job.status} — nothing to resume.")
+
+    cursor_data = json.loads(job.cursor) if job.cursor else {}
+    resume_cursor = cursor_data.get("resume_cursor")
+
+    job = transition(db, job, JobStatus.RUNNING, detail=f"resume requested from cursor={resume_cursor}")
+    background_tasks.add_task(
+        run_hubspot_ingestion,
+        job_id=job.id,
+        object_name=job.object_name,
+        org_id=job.org_id or "org1",
+        start_after=resume_cursor,
+    )
+    return job
+
+
+@router.post("/cancel/{job_id}", response_model=JobOut)
+def cancel_job(job_id: str, db: Session = Depends(get_db)):
+    job = get_job_or_404(db, job_id)
+    signal_pause(job_id)  # stop a still-running worker from doing more work first
+    return transition(db, job, JobStatus.CANCELLED)
+
+
+@router.delete("/remove/{job_id}")
+def remove_job(job_id: str, db: Session = Depends(get_db)):
+    job = get_job_or_404(db, job_id)
+    db.delete(job)
+    db.commit()
+    return {"status": "removed", "job_id": job_id}
+
+
+@router.get("/files")
+def browse_landed_files(object_name: Optional[str] = None):
+    """
+    The Parquet-in-MinIO file browser. dlt lays files out as
+    hubspot/{org_id}/{object}/*.parquet, so we filter by object name as a
+    path segment rather than a strict prefix, and skip dlt's own bookkeeping
+    files (_dlt_loads, _dlt_pipeline_state, etc.).
+    """
+    storage = get_storage()
+    all_files = storage.list_objects("hubspot/")
+    parquet_files = [f for f in all_files if f.endswith(".parquet")]
+    if object_name:
+        parquet_files = [f for f in parquet_files if f"/{object_name.lower()}/" in f]
+    return {"files": parquet_files}
+
+
+@router.get("/clickhouse/{object_name}")
+def inspect_clickhouse_table(object_name: str):
+    sink = get_clickhouse_sink()
+    if hasattr(sink, "inserted"):  # NullClickHouseSink
+        rows = sink.inserted.get(object_name, [])
+        distinct_ids = len({r["id"] for r in rows if "id" in r})
+        return {
+            "mode": "in-memory (ClickHouse disabled)",
+            "object_name": object_name,
+            "row_count": len(rows),
+            "distinct_ids": distinct_ids,
+            "sample": rows[:5],
+        }
+    return {"mode": "live", "table": sink._table_name(object_name)}  # noqa: SLF001

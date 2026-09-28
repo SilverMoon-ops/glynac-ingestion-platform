@@ -38,6 +38,7 @@ class Job(Base):
     id = Column(String, primary_key=True, default=_uuid)
     service = Column(String, nullable=False, index=True)   # salesforce | hubspot | slack
     object_name = Column(String, nullable=True)             # e.g. "Accounts", "Deals", "channel-C123"
+    org_id = Column(String, nullable=True, default="org1")  # tenant/org this sync is for
     status = Column(String, nullable=False, default=JobStatus.PENDING.value, index=True)
     cursor = Column(Text, nullable=True)                     # JSON checkpoint blob
     row_count = Column(Integer, nullable=False, default=0)

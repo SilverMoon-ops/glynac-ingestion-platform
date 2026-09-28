@@ -22,6 +22,7 @@ SchemaField = Tuple[str, str]  # (field_name, type_name)
 class ClickHouseSink(Protocol):
     def ensure_table(self, object_name: str, schema: List[SchemaField]) -> None: ...
     def insert_rows(self, object_name: str, rows: List[Dict]) -> None: ...
+    def ensure_view(self, object_name: str) -> None: ...
 
 
 class NullClickHouseSink:
@@ -33,18 +34,27 @@ class NullClickHouseSink:
 
     def __init__(self):
         self.tables_created: set[str] = set()
+        self.views_created: set[str] = set()
         self.inserted: Dict[str, List[Dict]] = {}
 
     def ensure_table(self, object_name: str, schema: List[SchemaField]) -> None:
         self.tables_created.add(object_name)
 
+    def ensure_view(self, object_name: str) -> None:
+        self.views_created.add(object_name)
+
     def insert_rows(self, object_name: str, rows: List[Dict]) -> None:
-        self.inserted.setdefault(object_name, []).extend(rows)
+        existing = self.inserted.setdefault(object_name, [])
+        by_id = {row["id"]: row for row in existing if "id" in row}
+        for row in rows:
+            if "id" in row:
+                by_id[row["id"]] = row  # last write wins, same as ReplacingMergeTree on merge
+        self.inserted[object_name] = list(by_id.values())
 
 
 class RealClickHouseSink:
     def __init__(self):
-        import clickhouse_connect  # type: ignore[import-not-found]  # imported lazily so it isn't required for local dev
+        import clickhouse_connect  # imported lazily so it isn't required for local dev
 
         self.client = clickhouse_connect.get_client(
             host=settings.clickhouse_host,
@@ -62,7 +72,7 @@ class RealClickHouseSink:
         columns_sql = ", ".join(f"{name} {CH_TYPE_MAP[type_]}" for name, type_ in schema)
         self.client.command(
             f"CREATE TABLE IF NOT EXISTS {self._table_name(object_name)} ({columns_sql}) "
-            f"ENGINE = MergeTree ORDER BY (organisation_id, id) PARTITION BY organisation_id"
+            f"ENGINE = ReplacingMergeTree ORDER BY (organisation_id, id) PARTITION BY organisation_id"
         )
 
     def insert_rows(self, object_name: str, rows: List[Dict]) -> None:
@@ -71,6 +81,18 @@ class RealClickHouseSink:
         columns = list(rows[0].keys())
         data = [[row.get(col) for col in columns] for row in rows]
         self.client.insert(self._table_name(object_name), data, column_names=columns)
+
+    def ensure_view(self, object_name: str) -> None:
+        """
+        Deduplicated read view. ReplacingMergeTree only merges duplicates in
+        the background, so ad-hoc SELECTs on the raw table can still see
+        stale rows briefly after a resumed/re-run load — FINAL forces the
+        dedup at query time for anyone querying through this view.
+        """
+        table = self._table_name(object_name)
+        self.client.command(
+            f"CREATE VIEW IF NOT EXISTS v_{table}_latest AS SELECT * FROM {table} FINAL"
+        )
 
 
 _sink_instance: ClickHouseSink | None = None

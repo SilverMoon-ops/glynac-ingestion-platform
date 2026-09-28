@@ -83,6 +83,7 @@ def run_salesforce_ingestion(
         sink = get_clickhouse_sink()
         sink.ensure_table(object_name, SALESFORCE_SCHEMAS[object_name])
         sink.insert_rows(object_name, valid_records)
+        sink.ensure_view(object_name)
 
         job = update_checkpoint(
             db, job,

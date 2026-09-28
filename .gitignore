@@ -5,3 +5,5 @@ __pycache__/
 glynac.db
 .env
 .DS_Store
+data/
+.dlt_pipelines/

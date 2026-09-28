@@ -45,11 +45,7 @@ class MinioStorage:
     """Real MinIO backend — requires `docker compose up -d`."""
 
     def __init__(self, endpoint: str, access_key: str, secret_key: str, bucket: str, secure: bool):
-        # Load the optional dependency dynamically so type checkers do not
-        # report an unresolved import when using the local backend.
-        from importlib import import_module
-
-        Minio = import_module("minio").Minio
+        from minio import Minio  # imported lazily so `minio` isn't required for local dev
 
         self.client = Minio(endpoint, access_key=access_key, secret_key=secret_key, secure=secure)
         self.bucket = bucket

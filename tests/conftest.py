@@ -33,6 +33,7 @@ def db_session(tmp_path, monkeypatch):
     # than through the get_db dependency above. Patch that too so background
     # work in a test lands in the same temp DB instead of the real one.
     monkeypatch.setattr("app.salesforce.ingest.SessionLocal", TestingSessionLocal)
+    monkeypatch.setattr("app.hubspot.ingest.SessionLocal", TestingSessionLocal)
 
     session = TestingSessionLocal()
     yield session
@@ -42,12 +43,14 @@ def db_session(tmp_path, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _isolated_storage_and_clickhouse(tmp_path, monkeypatch):
-    """Every test gets its own local object-storage folder and a fresh
-    in-memory ClickHouse sink, instead of sharing state (or a real server)."""
+    """Every test gets its own local object-storage folder, dlt pipelines
+    directory, and a fresh in-memory ClickHouse sink, instead of sharing
+    state (or a real server) across tests."""
     import app.storage as storage_module
     import app.clickhouse_sink as clickhouse_module
 
     monkeypatch.setattr(settings, "local_storage_root", str(tmp_path / "objects"))
+    monkeypatch.setattr(settings, "dlt_pipelines_dir", str(tmp_path / "dlt_pipelines"))
     storage_module._storage_instance = None
     clickhouse_module._sink_instance = None
     yield

@@ -42,7 +42,7 @@ def start_ingestion(
             status_code=400,
             detail=f"Unsupported object '{payload.object_name}'. See /api/salesforce/objects.",
         )
-    job = create_job(db, service="salesforce", object_name=payload.object_name)
+    job = create_job(db, service="salesforce", object_name=payload.object_name, org_id=payload.org_id)
     background_tasks.add_task(run_salesforce_ingestion, job.id, payload.object_name, payload.org_id)
     return job
 

@@ -31,5 +31,13 @@ class Settings:
     clickhouse_password: str = os.getenv("CLICKHOUSE_PASSWORD", "glynac_secret")
     clickhouse_database: str = os.getenv("CLICKHOUSE_DATABASE", "glynac")
 
+    dlt_pipelines_dir: str = os.getenv("DLT_PIPELINES_DIR", "./.dlt_pipelines")
+
+    # Mock HubSpot behaviour for the default (router-started) client. Raise
+    # latency / total records for demos so there's time to hit Pause mid-run.
+    hubspot_mock_latency_seconds: float = float(os.getenv("HUBSPOT_MOCK_LATENCY_SECONDS", "0.05"))
+    hubspot_mock_total_records: int = int(os.getenv("HUBSPOT_MOCK_TOTAL_RECORDS", "47"))
+    hubspot_mock_page_size: int = int(os.getenv("HUBSPOT_MOCK_PAGE_SIZE", "10"))
+
 
 settings = Settings()
