@@ -131,6 +131,8 @@ under `hubspot/org_live/...`.
 existing `glynac.db` from Day 0/1, delete it (or add the column manually) —
 `init_db()` only creates missing tables, it doesn't migrate existing ones.
 
+## Day 3 — Slack Dual-Mode Ingestion (done)
+
 ## Roadmap
 
 - [x] Day 0 — shared scaffold (job state machine, auth, retry, audit, tests)

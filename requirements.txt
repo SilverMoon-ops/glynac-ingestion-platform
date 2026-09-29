@@ -17,5 +17,5 @@ dlt[filesystem]==1.30.0
 pyarrow==17.0.0
 
 # Added from Day 3 onward, uncomment as needed:
-# slack_sdk==3.33.1
-# websockets==13.1
+slack_sdk==3.33.1
+websockets==13.1
