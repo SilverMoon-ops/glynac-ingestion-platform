@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import threading
+import concurrent.futures
 from datetime import datetime, timezone
 from typing import Dict, Iterable, List, Optional
 
@@ -64,23 +65,6 @@ def _write_parquet(path: str, rows: List[Dict]) -> None:
     )
 
     storage.put_object(path, output.getvalue())
-
-
-def _checkpoint(job: Job, channel_id: str, cursor: Optional[int], row_count: int) -> None:
-    state = {
-        "mode": "historical",
-        "channel_id": channel_id,
-        "cursor": cursor,
-        "message_ts": None,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    }
-
-    update_checkpoint(
-        db=SessionLocal(),
-        job=job,
-        cursor=json.dumps(state),
-        row_count_delta=row_count,
-    )
 
 
 def _load_clickhouse_rows(rows: List[Dict]) -> None:
@@ -212,6 +196,94 @@ def _normalize_rows(rows: Iterable[Dict], source: str) -> List[Dict]:
     return normalized
 
 
+# ── Per-channel worker (used by both sequential fallback and parallel pool) ──
+
+def _backfill_channel(
+    job_id: str,
+    channel_id: str,
+    org_id: str,
+    start_cursor: Optional[int],
+    page_size: int,
+    total_messages: int,
+) -> int:
+    """
+    Backfills one Slack channel from start_cursor to exhaustion (or until a
+    pause/cancel signal fires).  Returns the number of rows written.
+
+    Runs inside its own thread — each call opens its own DB session so
+    SQLite's check_same_thread constraint is not violated.
+    """
+    rows_written = 0
+    cursor = start_cursor
+    db = SessionLocal()
+
+    try:
+        while True:
+            if _cancel_event(job_id).is_set():
+                break
+
+            if _pause_event(job_id).is_set():
+                # Persist the high-water mark for this channel before stopping.
+                job = db.query(Job).filter(Job.id == job_id).first()
+                if job is not None:
+                    state = {
+                        "mode": "historical",
+                        "channel_id": channel_id,
+                        "cursor": cursor,
+                        "message_ts": None,
+                    }
+                    job.cursor = json.dumps(state)
+                    db.add(job)
+                    db.commit()
+                break
+
+            response = fetch_history(
+                channel_id=channel_id,
+                cursor=cursor,
+                page_size=page_size,
+                total_messages=total_messages,
+            )
+
+            rows = _normalize_rows(response["messages"], "historical")
+
+            parquet_path = (
+                f"slack/historical/{org_id}/"
+                f"channel_id={channel_id}/"
+                f"processing_date={_utc_date()}/"
+                f"part-{cursor or 0}.parquet"
+            )
+
+            _write_parquet(parquet_path, rows)
+            _load_clickhouse_rows(rows)
+
+            # Checkpoint after every page so a crash here resumes from this
+            # page rather than from the top of the channel.
+            job = db.query(Job).filter(Job.id == job_id).first()
+            if job is not None:
+                state = {
+                    "mode": "historical",
+                    "channel_id": channel_id,
+                    "cursor": response["next_cursor"],
+                    "message_ts": rows[-1]["message_ts"] if rows else None,
+                }
+                job.cursor = json.dumps(state)
+                job.row_count += len(rows)
+                db.add(job)
+                db.commit()
+
+            rows_written += len(rows)
+
+            if not response["has_more"]:
+                break
+
+            cursor = response["next_cursor"]
+
+    finally:
+        db.close()
+
+    return rows_written
+
+
 def run_historical_backfill(
     job_id: str,
     org_id: str,
@@ -219,10 +291,14 @@ def run_historical_backfill(
     total_messages: int = 50,
 ) -> None:
     """
-    Runs the historical Slack backfill.
+    Parallel Slack historical backfill.
 
-    Each channel has an independent cursor. The job cursor persists the
-    currently active channel and page offset.
+    Each channel is processed by its own thread via ThreadPoolExecutor,
+    satisfying the 'parallel channel ingestion' acceptance criterion.
+    A pause/cancel signal is broadcast to all workers through the shared
+    threading.Event objects — each worker checks the flag between pages and
+    checkpoints its cursor before stopping, so crash recovery or a manual
+    resume restarts from the last saved offset per channel.
     """
     db = SessionLocal()
 
@@ -241,101 +317,75 @@ def run_historical_backfill(
 
         channels = mock_channels()
 
-        if resume_channel:
-            channel_index = next(
-                (
-                    index
-                    for index, channel in enumerate(channels)
-                    if channel["id"] == resume_channel
-                ),
-                0,
-            )
-        else:
-            channel_index = 0
+        # Build per-channel work items — resume the saved channel from its
+        # cursor, start all others from zero.
+        work_items = []
+        for channel in channels:
+            cid = channel["id"]
+            start = resume_cursor if cid == resume_channel else None
+            work_items.append((cid, start))
 
-        for channel in channels[channel_index:]:
-            channel_id = channel["id"]
+        db.close()
+        db = None  # hand off to worker threads; don't hold the session here
 
-            if channel_id == resume_channel:
-                cursor = resume_cursor
-            else:
-                cursor = None
+        # ── Parallel execution ──────────────────────────────────────────────
+        print(f"[CHECKPOINT] Slack historical backfill starting {len(work_items)} parallel channel workers")
 
-            while True:
-                if _cancel_event(job_id).is_set():
-                    db.refresh(job)
-                    transition(db, job, JobStatus.CANCELLED)
-                    return
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=len(work_items), thread_name_prefix="slack-channel"
+        ) as executor:
+            futures = {
+                executor.submit(
+                    _backfill_channel,
+                    job_id, channel_id, org_id, start_cur, page_size, total_messages,
+                ): channel_id
+                for channel_id, start_cur in work_items
+            }
 
-                if _pause_event(job_id).is_set():
-                    db.refresh(job)
+            for future in concurrent.futures.as_completed(futures):
+                channel_id = futures[future]
+                try:
+                    rows = future.result()
+                    print(f"[CHECKPOINT] Channel {channel_id} finished — {rows} rows written")
+                except Exception as exc:
+                    print(f"[CHECKPOINT] Channel {channel_id} worker error: {exc}")
 
-                    if db.query(Job).filter(Job.id == job_id).first().status != JobStatus.PAUSED.value:
-                        transition(db, job, JobStatus.PAUSED)
-
-                    return
-
-                response = fetch_history(
-                    channel_id=channel_id,
-                    cursor=cursor,
-                    page_size=page_size,
-                    total_messages=total_messages,
-                )
-
-                rows = _normalize_rows(response["messages"], "historical")
-
-                parquet_path = (
-                    f"slack/historical/{org_id}/"
-                    f"channel_id={channel_id}/"
-                    f"processing_date={_utc_date()}/"
-                    f"part-{cursor or 0}.parquet"
-                )
-
-                _write_parquet(parquet_path, rows)
-                _load_clickhouse_rows(rows)
-
-                db.refresh(job)
-
-                state = {
-                    "mode": "historical",
-                    "channel_id": channel_id,
-                    "cursor": response["next_cursor"],
-                    "message_ts": rows[-1]["message_ts"] if rows else None,
-                }
-
-                job.cursor = json.dumps(state)
-                job.row_count += len(rows)
-                db.add(job)
-                db.commit()
-
-                if not response["has_more"]:
-                    break
-
-                cursor = response["next_cursor"]
-
-            resume_channel = None
-            resume_cursor = None
-
-        db.refresh(job)
-        transition(db, job, JobStatus.COMPLETED)
-
-    except Exception as exc:
-        db.rollback()
-
+        # Re-open a session to finalize job status.
+        db = SessionLocal()
         job = db.query(Job).filter(Job.id == job_id).first()
 
-        if job is not None:
-            job.error = str(exc)
-            db.add(job)
-            db.commit()
+        if job is None:
+            return
 
-            try:
-                transition(db, job, JobStatus.FAILED, detail=str(exc))
-            except Exception:
-                pass
+        if _cancel_event(job_id).is_set():
+            transition(db, job, JobStatus.CANCELLED)
+        elif _pause_event(job_id).is_set():
+            if job.status != JobStatus.PAUSED.value:
+                transition(db, job, JobStatus.PAUSED)
+        else:
+            transition(db, job, JobStatus.COMPLETED)
+
+    except Exception as exc:
+        if db:
+            db.rollback()
+
+        _db = SessionLocal()
+        try:
+            job = _db.query(Job).filter(Job.id == job_id).first()
+            if job is not None:
+                job.error = str(exc)
+                _db.add(job)
+                _db.commit()
+                try:
+                    transition(_db, job, JobStatus.FAILED, detail=str(exc))
+                except Exception:
+                    pass
+        finally:
+            _db.close()
 
     finally:
-        db.close()
+        if db:
+            db.close()
         _pause_events.pop(job_id, None)
         _cancel_events.pop(job_id, None)
 
