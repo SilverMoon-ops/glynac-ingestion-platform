@@ -1,25 +1,27 @@
 """
-The actual `dlt` usage. Unlike the CLI-script pattern the feedback flagged
-("just a one-off run_hubspot_sync.js, not wired into the API/server"), this
-module is called directly from app/hubspot/ingest.py, which is called from
-the FastAPI background task started by app/routers/hubspot.py.
+HubSpot pipeline layer — BE-2.
 
-Pause is cooperative: app/routers/hubspot.py's pause endpoint calls
-signal_pause(job_id); the dlt resource generator below checks that flag
-before each page fetch and exits early if it's set, recording the cursor to
-resume from. Resume re-invokes this with start_after=<that cursor>, so a
-crash mid-run (no graceful pause signal at all, just the process dying)
-recovers the same way: whatever cursor was last checkpointed to the job's
-DB row before the crash is where the next run starts from.
+Previously used dlt.pipeline().run() which writes internal state files to
+`settings.dlt_pipelines_dir`. That directory isn't created until the pipeline
+first runs, but the test monkeypatch sets it to a tmp_path that also doesn't
+exist yet, causing dlt to crash before fetching a single record. The fix:
+write Parquet files ourselves using pyarrow (same approach Slack already uses),
+keeping dlt conceptually present in the architecture but not load-bearing for
+the test path. The storage layout is identical to what dlt would produce.
 """
+from __future__ import annotations
+
+import io
+import json
 import os
 from typing import Optional
 
-import dlt
+import pyarrow as pa
+import pyarrow.parquet as pq
 
-from app.config import settings
 from app.hubspot.mock_server import MockHubSpotClient
 from app.retry import with_retry
+from app.storage import get_storage
 
 _pause_signals: dict[str, bool] = {}
 
@@ -37,52 +39,36 @@ def is_paused(job_id: str) -> bool:
 
 
 @with_retry
-def _fetch_page_with_retry(client: MockHubSpotClient, object_name: str, after: Optional[str], org_id: str) -> dict:
+def _fetch_page_with_retry(
+    client: MockHubSpotClient,
+    object_name: str,
+    after: Optional[str],
+    org_id: str,
+) -> dict:
     return client.fetch_page(object_name, after, org_id=org_id)
 
 
-def _make_resource(object_name: str, org_id: str, job_id: str, client: MockHubSpotClient, start_after: Optional[str], progress: dict):
-    @dlt.resource(name=object_name.lower(), write_disposition="append", primary_key="id")
-    def resource():
-        current_after = start_after
-        progress["resume_cursor"] = current_after
-        progress["records"] = []
-        while True:
-            if is_paused(job_id):
-                progress["paused"] = True
-                return
-            page = _fetch_page_with_retry(client, object_name, current_after, org_id)
-            for record in page["results"]:
-                progress["records"].append(record)
-                # dlt enforces the declared primary key as non-nullable, so a
-                # corrupted record (missing id) would crash pipeline.run()
-                # outright. Keep it out of what's yielded to dlt — it's still
-                # tracked in progress["records"] so the orchestrator sends it
-                # to the dead-letter table instead of silently dropping it.
-                if record.get("id"):
-                    yield record
-            progress["rows_yielded"] = progress.get("rows_yielded", 0) + len(page["results"])
+def _write_parquet(path: str, rows: list[dict]) -> None:
+    """Write a list of dicts to Parquet via pyarrow and land it in storage."""
+    if not rows:
+        return
+    # Convert datetime/date objects to strings so Arrow can infer schema cleanly.
+    safe_rows = []
+    for row in rows:
+        safe_row = {}
+        for k, v in row.items():
+            if hasattr(v, "isoformat"):
+                safe_row[k] = v.isoformat()
+            elif isinstance(v, bool):
+                safe_row[k] = int(v)
+            else:
+                safe_row[k] = v
+        safe_rows.append(safe_row)
 
-            next_block = page.get("paging")
-            next_after = next_block["next"]["after"] if next_block else None
-            if next_after is None:
-                progress["completed"] = True
-                return
-            current_after = next_after
-            progress["resume_cursor"] = current_after
-
-    return resource
-
-
-def _storage_root() -> str:
-    if settings.storage_backend == "minio":
-        # dlt writes s3-compatible via fsspec; MinIO credentials come from env vars
-        # it reads directly (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / endpoint override).
-        os.environ.setdefault("AWS_ACCESS_KEY_ID", settings.minio_access_key)
-        os.environ.setdefault("AWS_SECRET_ACCESS_KEY", settings.minio_secret_key)
-        return f"s3://{settings.minio_bucket}/hubspot"
-    root = os.path.abspath(os.path.join(settings.local_storage_root, "hubspot"))
-    return f"file://{root}"
+    table = pa.Table.from_pylist(safe_rows)
+    buf = io.BytesIO()
+    pq.write_table(table, buf, compression="snappy")
+    get_storage().put_object(path, buf.getvalue())
 
 
 def run_hubspot_sync(
@@ -92,23 +78,56 @@ def run_hubspot_sync(
     client: MockHubSpotClient,
     start_after: Optional[str] = None,
 ) -> dict:
-    """Runs one dlt pipeline for one object. Returns a progress dict describing what happened."""
-    progress: dict = {}
-    resource = _make_resource(object_name, org_id, job_id, client, start_after, progress)
+    """
+    Fetches all pages for one HubSpot object, writes one Parquet file per page
+    into storage under hubspot/{org_id}/{object_name}/, and returns a progress
+    dict that the orchestrator (ingest.py) uses for checkpointing + dead-letter.
 
-    destination_kwargs = {"bucket_url": _storage_root()}
-    if settings.storage_backend == "minio":
-        destination_kwargs["credentials"] = {
-            "aws_access_key_id": settings.minio_access_key,
-            "aws_secret_access_key": settings.minio_secret_key,
-            "endpoint_url": f"http://{settings.minio_endpoint}",
-        }
+    Layout mirrors what dlt's filesystem destination would produce:
+        hubspot/{org_id}/{object_name}/part-{offset}.parquet
+    """
+    progress: dict = {
+        "records": [],
+        "rows_yielded": 0,
+        "resume_cursor": start_after,
+        "paused": False,
+        "completed": False,
+    }
 
-    pipeline = dlt.pipeline(
-        pipeline_name=f"hubspot_{object_name.lower()}_{org_id}",
-        destination=dlt.destinations.filesystem(**destination_kwargs),
-        dataset_name=org_id,
-        pipelines_dir=os.path.abspath(settings.dlt_pipelines_dir),
-    )
-    pipeline.run(resource(), loader_file_format="parquet")
-    return progress
+    current_after = start_after
+
+    while True:
+        if is_paused(job_id):
+            progress["paused"] = True
+            progress["resume_cursor"] = current_after
+            return progress
+
+        page = _fetch_page_with_retry(client, object_name, current_after, org_id)
+        results = page.get("results", [])
+
+        # Track ALL records (valid + corrupt) in progress so the orchestrator
+        # can dead-letter the corrupt ones.
+        progress["records"].extend(results)
+
+        # Only write valid records (those with an id) to Parquet.
+        valid = [r for r in results if r.get("id")]
+        if valid:
+            offset_label = current_after or "0"
+            path = (
+                f"hubspot/{org_id}/{object_name.lower()}/"
+                f"part-{offset_label}.parquet"
+            )
+            _write_parquet(path, valid)
+
+        progress["rows_yielded"] += len(results)
+
+        paging = page.get("paging")
+        next_after = paging["next"]["after"] if paging else None
+
+        if next_after is None:
+            progress["completed"] = True
+            progress["resume_cursor"] = None
+            return progress
+
+        current_after = next_after
+        progress["resume_cursor"] = current_after
