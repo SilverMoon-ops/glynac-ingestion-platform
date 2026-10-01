@@ -48,13 +48,13 @@ class NullClickHouseSink:
         by_id = {row["id"]: row for row in existing if "id" in row}
         for row in rows:
             if "id" in row:
-                by_id[row["id"]] = row  # last write wins, same as ReplacingMergeTree on merge
+                by_id[row["id"]] = row
         self.inserted[object_name] = list(by_id.values())
 
 
 class RealClickHouseSink:
     def __init__(self):
-        import clickhouse_connect  # imported lazily so it isn't required for local dev
+        import clickhouse_connect
 
         self.client = clickhouse_connect.get_client(
             host=settings.clickhouse_host,
@@ -78,17 +78,36 @@ class RealClickHouseSink:
     def insert_rows(self, object_name: str, rows: List[Dict]) -> None:
         if not rows:
             return
+        from datetime import datetime, timezone
+
+        def _coerce(val):
+            if isinstance(val, bool):
+                return int(val)
+            if isinstance(val, str):
+                for fmt in (
+                    "%Y-%m-%dT%H:%M:%S%z",
+                    "%Y-%m-%dT%H:%M:%S.%f%z",
+                    "%Y-%m-%dT%H:%M:%S",
+                    "%Y-%m-%dT%H:%M:%S.%f",
+                ):
+                    try:
+                        dt = datetime.strptime(val, fmt)
+                        if dt.tzinfo is not None:
+                            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+                        return dt
+                    except ValueError:
+                        continue
+            if isinstance(val, datetime):
+                if val.tzinfo is not None:
+                    val = val.astimezone(timezone.utc).replace(tzinfo=None)
+                return val
+            return val
+
         columns = list(rows[0].keys())
-        data = [[row.get(col) for col in columns] for row in rows]
+        data = [[_coerce(row.get(col)) for col in columns] for row in rows]
         self.client.insert(self._table_name(object_name), data, column_names=columns)
 
     def ensure_view(self, object_name: str) -> None:
-        """
-        Deduplicated read view. ReplacingMergeTree only merges duplicates in
-        the background, so ad-hoc SELECTs on the raw table can still see
-        stale rows briefly after a resumed/re-run load — FINAL forces the
-        dedup at query time for anyone querying through this view.
-        """
         table = self._table_name(object_name)
         self.client.command(
             f"CREATE VIEW IF NOT EXISTS v_{table}_latest AS SELECT * FROM {table} FINAL"

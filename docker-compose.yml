@@ -1,13 +1,11 @@
-version: "3.8"
-
 services:
   minio:
-    image: minio/minio:latest
+    image: quay.io/minio/minio:latest
     container_name: glynac-minio
     command: server /data --console-address ":9001"
     ports:
-      - "9000:9000"   # S3 API
-      - "9001:9001"   # Web console
+      - "9000:9000"
+      - "9001:9001"
     environment:
       MINIO_ROOT_USER: glynac_admin
       MINIO_ROOT_PASSWORD: glynac_secret_key
@@ -23,8 +21,8 @@ services:
     image: clickhouse/clickhouse-server:latest
     container_name: glynac-clickhouse
     ports:
-      - "8123:8123"   # HTTP interface
-      - "9002:9000"   # Native TCP interface (remapped, 9000 is taken by MinIO)
+      - "8123:8123"
+      - "9002:9000"
     environment:
       CLICKHOUSE_USER: glynac
       CLICKHOUSE_PASSWORD: glynac_secret
