@@ -43,13 +43,17 @@ def db_session(tmp_path, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _isolated_storage_and_clickhouse(tmp_path, monkeypatch):
-    """Every test gets its own local object-storage folder and a fresh
-    in-memory ClickHouse sink — no shared state, no Docker required."""
+    """Every test gets its own local storage folder and a fresh in-memory
+    NullClickHouseSink — regardless of what .env says. Docker settings must
+    never leak into tests."""
     import app.storage as storage_module
     import app.clickhouse_sink as clickhouse_module
 
+    # Force local storage and null ClickHouse sink even if .env has Docker settings
     monkeypatch.setattr(settings, "local_storage_root", str(tmp_path / "objects"))
     monkeypatch.setattr(settings, "dlt_pipelines_dir", str(tmp_path / "dlt_pipelines"))
+    monkeypatch.setattr(settings, "clickhouse_enabled", False)
+    monkeypatch.setattr(settings, "storage_backend", "local")
     storage_module._storage_instance = None
     clickhouse_module._sink_instance = None
     yield
