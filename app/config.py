@@ -31,6 +31,14 @@ class Settings:
     clickhouse_password: str = os.getenv("CLICKHOUSE_PASSWORD", "glynac_secret")
     clickhouse_database: str = os.getenv("CLICKHOUSE_DATABASE", "glynac")
 
+        # Salesforce (optional) — leave blank to use mock
+    salesforce_client_id: str = os.getenv("SALESFORCE_CLIENT_ID", "")
+    salesforce_client_secret: str = os.getenv("SALESFORCE_CLIENT_SECRET", "")
+    salesforce_instance_url: str = os.getenv("SALESFORCE_INSTANCE_URL", "https://login.salesforce.com")
+    
+    # Force mock even if real credentials are set (for testing)
+    salesforce_mock_enabled: bool = os.getenv("SALESFORCE_MOCK_ENABLED", "true").lower() == "true"
+
     dlt_pipelines_dir: str = os.getenv("DLT_PIPELINES_DIR", "./.dlt_pipelines")
 
     # Mock HubSpot behaviour for the default (router-started) client. Raise
