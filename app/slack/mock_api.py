@@ -30,6 +30,9 @@ def fetch_history(
 
     The cursor is represented as an integer offset. Real Slack uses an opaque
     cursor string, but the checkpoint behavior is equivalent.
+    
+    Returns messages with thread replies, file metadata, and reactions for
+    compliance use cases.
     """
     start = int(cursor or 0)
     end = min(start + page_size, total_messages)
@@ -38,30 +41,42 @@ def fetch_history(
 
     for index in range(start, end):
         message_ts = f"170000{index:05d}.000000"
+        user_id = f"U00{(index % 3) + 1}"
 
+        # Main message
         messages.append(
             {
                 "id": f"{channel_id}:{message_ts}",
                 "channel_id": channel_id,
-                "user_id": f"U00{(index % 3) + 1}",
+                "user_id": user_id,
                 "text": f"Historical message {index} from {channel_id}",
                 "message_ts": message_ts,
                 "thread_ts": None,
                 "source": "historical",
+                # File metadata
+                "files": [
+                    {"id": f"F{index}-0", "name": f"report_{index}.pdf", "type": "pdf", "size": 1024 * (index + 1)}
+                ] if index % 7 == 0 else [],
+                # Reactions
+                "reactions": [{"name": "thumbsup", "users": ["U001", "U002"]}] if index % 5 == 0 else [],
             }
         )
 
-        # Every fifth message receives a mock thread reply.
-        if index % 5 == 0:
+        # Every third message gets a thread reply
+        if index % 3 == 0 and index < total_messages - 1:
+            thread_ts = message_ts
+            reply_ts = f"170000{index:05d}.100000"
             messages.append(
                 {
-                    "id": f"{channel_id}:{message_ts}:reply",
+                    "id": f"{channel_id}:{reply_ts}",
                     "channel_id": channel_id,
                     "user_id": "U002",
                     "text": f"Thread reply to message {index}",
-                    "message_ts": f"170000{index:05d}.100000",
-                    "thread_ts": message_ts,
+                    "message_ts": reply_ts,
+                    "thread_ts": thread_ts,
                     "source": "historical",
+                    "files": [],
+                    "reactions": [],
                 }
             )
 

@@ -1,4 +1,29 @@
+version: "3.9"
+
 services:
+  api:
+    build: .
+    container_name: glynac-api
+    ports:
+      - "8000:8000"
+    depends_on:
+      minio:
+        condition: service_healthy
+      clickhouse:
+        condition: service_started
+    environment:
+      STORAGE_BACKEND: minio
+      CLICKHOUSE_ENABLED: true
+      HMAC_SECRET: local-dev-secret-change-in-prod
+      SALESFORCE_MOCK_ENABLED: true
+      HUBSPOT_MOCK_ENABLED: true
+    volumes:
+      - ./data:/app/data
+      - ./.dlt_pipelines:/app/.dlt_pipelines
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    networks:
+      - glynac-network
+
   minio:
     image: quay.io/minio/minio:latest
     container_name: glynac-minio
@@ -16,6 +41,8 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - glynac-network
 
   clickhouse:
     image: clickhouse/clickhouse-server:latest
@@ -33,7 +60,13 @@ services:
       nofile:
         soft: 262144
         hard: 262144
+    networks:
+      - glynac-network
 
 volumes:
   minio_data:
   clickhouse_data:
+
+networks:
+  glynac-network:
+    driver: bridge

@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 from app.audit import send_to_dead_letter
 from app.database import SessionLocal
 from app.jobs import transition, update_checkpoint
-from app.models import Job, JobStatus
+from app.models import Job, JobStatus, ChannelCheckpoint
 from app.slack.mock_api import fetch_history, mock_channels, mock_users
 from app.storage import get_storage
 
@@ -89,6 +89,7 @@ def _load_clickhouse_rows(rows: List[Dict]) -> None:
         database=settings.clickhouse_database,
     )
 
+    # ── Main messages table ──
     client.command(
         """
         CREATE TABLE IF NOT EXISTS bronze_slack_messages
@@ -109,24 +110,127 @@ def _load_clickhouse_rows(rows: List[Dict]) -> None:
         """
     )
 
+    # ── Users metadata table ──
+    client.command(
+        """
+        CREATE TABLE IF NOT EXISTS slack_users
+        (
+            user_id String,
+            name String,
+            real_name String,
+            profile_email Nullable(String),
+            is_bot Boolean
+        )
+        ENGINE = ReplacingMergeTree()
+        ORDER BY user_id
+        """
+    )
+
+    # ── Channels metadata table ──
+    client.command(
+        """
+        CREATE TABLE IF NOT EXISTS slack_channels
+        (
+            channel_id String,
+            name String,
+            topic String,
+            is_private Boolean,
+            created Int64
+        )
+        ENGINE = ReplacingMergeTree()
+        ORDER BY channel_id
+        """
+    )
+
+    # ── Thread replies table ──
+    client.command(
+        """
+        CREATE TABLE IF NOT EXISTS slack_threads
+        (
+            thread_ts String,
+            channel_id String,
+            reply_count Int32,
+            latest_reply_ts String
+        )
+        ENGINE = ReplacingMergeTree()
+        ORDER BY (channel_id, thread_ts)
+        """
+    )
+
+    # ── File metadata table ──
+    client.command(
+        """
+        CREATE TABLE IF NOT EXISTS slack_files
+        (
+            file_id String,
+            message_id String,
+            channel_id String,
+            file_name String,
+            file_type String,
+            size Int64
+        )
+        ENGINE = ReplacingMergeTree()
+        ORDER BY (channel_id, file_id)
+        """
+    )
+
+    # ── Reactions table ──
+    client.command(
+        """
+        CREATE TABLE IF NOT EXISTS slack_reactions
+        (
+            message_id String,
+            channel_id String,
+            emoji String,
+            user_id String
+        )
+        ENGINE = ReplacingMergeTree()
+        ORDER BY (channel_id, message_id, emoji)
+        """
+    )
+
+    # ── THE COMPLIANCE TIMELINE VIEW — joins everything ──
     client.command(
         """
         CREATE VIEW IF NOT EXISTS v_slack_compliance_timeline AS
         SELECT
-            message_id,
-            channel_id,
-            user_id,
-            text,
-            message_ts,
-            thread_ts,
-            source,
-            processing_date,
-            inserted_at
-        FROM bronze_slack_messages
-        FINAL
+            m.message_id,
+            m.channel_id,
+            c.name as channel_name,
+            m.user_id,
+            u.real_name as user_name,
+            u.profile_email,
+            m.text,
+            m.message_ts,
+            m.thread_ts,
+            arrayConcat(
+                groupArray(DISTINCT f.file_name),
+                []
+            ) as attached_files,
+            groupArray(DISTINCT r.emoji) as reactions,
+            m.source,
+            m.processing_date,
+            m.inserted_at
+        FROM bronze_slack_messages m
+        LEFT JOIN slack_channels c ON m.channel_id = c.channel_id
+        LEFT JOIN slack_users u ON m.user_id = u.user_id
+        LEFT JOIN slack_files f ON m.message_id = f.message_id
+        LEFT JOIN slack_reactions r ON m.message_id = r.message_id
+        WHERE m.message_id IN (
+            SELECT message_id FROM bronze_slack_messages
+            WHERE (message_id, inserted_at) IN (
+                SELECT message_id, MAX(inserted_at) FROM bronze_slack_messages
+                GROUP BY message_id
+            )
+        )
+        GROUP BY
+            m.message_id, m.channel_id, c.name, m.user_id, u.real_name, u.profile_email,
+            m.text, m.message_ts, m.thread_ts, m.source, m.processing_date, m.inserted_at
+        ORDER BY m.message_ts DESC
         """
     )
 
+    # Insert into main messages table
     columns = [
         "message_id",
         "channel_id",
@@ -138,7 +242,6 @@ def _load_clickhouse_rows(rows: List[Dict]) -> None:
         "processing_date",
         "inserted_at",
     ]
-
     values = []
 
     for row in rows:
@@ -156,11 +259,12 @@ def _load_clickhouse_rows(rows: List[Dict]) -> None:
             ]
         )
 
-    client.insert(
-        "bronze_slack_messages",
-        values,
-        column_names=columns,
-    )
+    if values:
+        client.insert(
+            "bronze_slack_messages",
+            values,
+            column_names=columns,
+        )
 
 
 def _normalize_rows(rows: Iterable[Dict], source: str) -> List[Dict]:
@@ -196,8 +300,6 @@ def _normalize_rows(rows: Iterable[Dict], source: str) -> List[Dict]:
     return normalized
 
 
-# ── Per-channel worker (used by both sequential fallback and parallel pool) ──
-
 def _backfill_channel(
     job_id: str,
     channel_id: str,
@@ -212,6 +314,8 @@ def _backfill_channel(
 
     Runs inside its own thread — each call opens its own DB session so
     SQLite's check_same_thread constraint is not violated.
+    
+    ✅ Per-channel checkpoint: Saves and resumes from channel-specific cursor.
     """
     rows_written = 0
     cursor = start_cursor
@@ -223,18 +327,28 @@ def _backfill_channel(
                 break
 
             if _pause_event(job_id).is_set():
-                # Persist the high-water mark for this channel before stopping.
-                job = db.query(Job).filter(Job.id == job_id).first()
-                if job is not None:
-                    state = {
-                        "mode": "historical",
-                        "channel_id": channel_id,
-                        "cursor": cursor,
-                        "message_ts": None,
-                    }
-                    job.cursor = json.dumps(state)
-                    db.add(job)
-                    db.commit()
+                # Save checkpoint for THIS SPECIFIC CHANNEL
+                ckpt = (
+                    db.query(ChannelCheckpoint)
+                    .filter(
+                        ChannelCheckpoint.job_id == job_id,
+                        ChannelCheckpoint.channel_id == channel_id,
+                    )
+                    .first()
+                )
+                if ckpt is None:
+                    ckpt = ChannelCheckpoint(
+                        job_id=job_id,
+                        channel_id=channel_id,
+                        cursor=cursor,
+                        message_ts=None,
+                        mode="historical",
+                    )
+                else:
+                    ckpt.cursor = cursor
+                    ckpt.message_ts = None
+                db.add(ckpt)
+                db.commit()
                 break
 
             response = fetch_history(
@@ -256,20 +370,35 @@ def _backfill_channel(
             _write_parquet(parquet_path, rows)
             _load_clickhouse_rows(rows)
 
-            # Checkpoint after every page so a crash here resumes from this
-            # page rather than from the top of the channel.
+            # Checkpoint after every page — save cursor for THIS channel
+            ckpt = (
+                db.query(ChannelCheckpoint)
+                .filter(
+                    ChannelCheckpoint.job_id == job_id,
+                    ChannelCheckpoint.channel_id == channel_id,
+                )
+                .first()
+            )
+            if ckpt is None:
+                ckpt = ChannelCheckpoint(
+                    job_id=job_id,
+                    channel_id=channel_id,
+                    cursor=response["next_cursor"],
+                    message_ts=rows[-1]["message_ts"] if rows else None,
+                    mode="historical",
+                )
+            else:
+                ckpt.cursor = response["next_cursor"]
+                ckpt.message_ts = rows[-1]["message_ts"] if rows else None
+            db.add(ckpt)
+
+            # Also update main job row count
             job = db.query(Job).filter(Job.id == job_id).first()
             if job is not None:
-                state = {
-                    "mode": "historical",
-                    "channel_id": channel_id,
-                    "cursor": response["next_cursor"],
-                    "message_ts": rows[-1]["message_ts"] if rows else None,
-                }
-                job.cursor = json.dumps(state)
                 job.row_count += len(rows)
                 db.add(job)
-                db.commit()
+
+            db.commit()
 
             rows_written += len(rows)
 
@@ -293,12 +422,8 @@ def run_historical_backfill(
     """
     Parallel Slack historical backfill.
 
-    Each channel is processed by its own thread via ThreadPoolExecutor,
-    satisfying the 'parallel channel ingestion' acceptance criterion.
-    A pause/cancel signal is broadcast to all workers through the shared
-    threading.Event objects — each worker checks the flag between pages and
-    checkpoints its cursor before stopping, so crash recovery or a manual
-    resume restarts from the last saved offset per channel.
+    Each channel is processed by its own thread via ThreadPoolExecutor.
+    Per-channel checkpoints ensure crash recovery works independently for each channel.
     """
     db = SessionLocal()
 
@@ -311,22 +436,28 @@ def run_historical_backfill(
         if job.status == JobStatus.PENDING.value:
             job = transition(db, job, JobStatus.RUNNING)
 
-        previous_state = json.loads(job.cursor) if job.cursor else {}
-        resume_channel = previous_state.get("channel_id")
-        resume_cursor = previous_state.get("cursor")
-
         channels = mock_channels()
 
-        # Build per-channel work items — resume the saved channel from its
-        # cursor, start all others from zero.
+        # Build per-channel work items
         work_items = []
         for channel in channels:
             cid = channel["id"]
-            start = resume_cursor if cid == resume_channel else None
+            
+            # Try to resume from saved checkpoint
+            ckpt = (
+                db.query(ChannelCheckpoint)
+                .filter(
+                    ChannelCheckpoint.job_id == job_id,
+                    ChannelCheckpoint.channel_id == cid,
+                )
+                .first()
+            )
+            
+            start = ckpt.cursor if ckpt else None
             work_items.append((cid, start))
 
         db.close()
-        db = None  # hand off to worker threads; don't hold the session here
+        db = None  # hand off to worker threads
 
         # ── Parallel execution ──────────────────────────────────────────────
         print(f"[CHECKPOINT] Slack historical backfill starting {len(work_items)} parallel channel workers")
@@ -350,7 +481,7 @@ def run_historical_backfill(
                 except Exception as exc:
                     print(f"[CHECKPOINT] Channel {channel_id} worker error: {exc}")
 
-        # Re-open a session to finalize job status.
+        # Re-open a session to finalize job status
         db = SessionLocal()
         job = db.query(Job).filter(Job.id == job_id).first()
 
@@ -424,14 +555,6 @@ def ingest_realtime_event(
         job = db.query(Job).filter(Job.id == job_id).first()
 
         if job is not None:
-            state = {
-                "mode": "realtime",
-                "channel_id": row["channel_id"],
-                "cursor": None,
-                "message_ts": row["message_ts"],
-            }
-
-            job.cursor = json.dumps(state)
             job.row_count += 1
             db.add(job)
             db.commit()

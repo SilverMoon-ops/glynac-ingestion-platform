@@ -2,7 +2,7 @@ import enum
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import Column, String, Integer, Text, DateTime, ForeignKey
+from sqlalchemy import Column, String, Integer, Text, DateTime, ForeignKey, UniqueConstraint
 from sqlalchemy.orm import relationship
 
 from app.database import Base
@@ -77,3 +77,29 @@ class DeadLetter(Base):
     created_at = Column(DateTime, default=_now)
 
     job = relationship("Job", back_populates="dead_letters")
+
+
+class ChannelCheckpoint(Base):
+    """
+    Per-channel checkpoint for Slack ingestion.
+    One row per (job_id, channel_id) combination.
+    Stores the high-water mark (cursor + message_ts) for crash recovery.
+    """
+
+    __tablename__ = "channel_checkpoint"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    job_id = Column(String, ForeignKey("jobs.id"), nullable=False, index=True)
+    channel_id = Column(String, nullable=False, index=True)
+    cursor = Column(Integer, nullable=True)  # pagination cursor
+    message_ts = Column(String, nullable=True)  # high-water mark (last message timestamp)
+    mode = Column(String, nullable=False)  # "historical" or "realtime"
+    created_at = Column(DateTime, default=_now)
+    updated_at = Column(DateTime, default=_now, onupdate=_now)
+
+    job = relationship("Job", foreign_keys=[job_id])
+
+    __table_args__ = (
+        # Enforce one checkpoint per channel per job
+        UniqueConstraint("job_id", "channel_id", name="uq_job_channel"),
+    )

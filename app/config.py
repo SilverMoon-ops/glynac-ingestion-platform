@@ -41,6 +41,10 @@ class Settings:
 
     dlt_pipelines_dir: str = os.getenv("DLT_PIPELINES_DIR", "./.dlt_pipelines")
 
+        # HubSpot real API (optional)
+    hubspot_api_key: str = os.getenv("HUBSPOT_API_KEY", "")
+    hubspot_mock_enabled: bool = os.getenv("HUBSPOT_MOCK_ENABLED", "true").lower() == "true"
+
     # Mock HubSpot behaviour for the default (router-started) client. Raise
     # latency / total records for demos so there's time to hit Pause mid-run.
     hubspot_mock_latency_seconds: float = float(os.getenv("HUBSPOT_MOCK_LATENCY_SECONDS", "0.05"))

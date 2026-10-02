@@ -1,21 +1,23 @@
 """
 HubSpot ingestion pipeline — BE-2.
 
-Uses `dlt` (data load tool) as the primary pipeline engine with the filesystem
-destination writing Parquet files to MinIO. In test environments where dlt's
-internal state directory isn't available, it falls back to writing Parquet
-directly with pyarrow so tests remain fast and dependency-free.
+Primary production path uses `dlt` with filesystem destination writing Parquet files.
+If FORCE_PYARROW_FALLBACK=true or dlt is not available in test environment,
+falls back to direct pyarrow for identical output layout.
 
 Architecture:
   run_hubspot_sync()
-    └── tries dlt.pipeline(...).run()          ← production path (shown in video)
-        └── on dlt failure → _pyarrow_fallback()  ← test/CI path (same output layout)
+    ├── if FORCE_PYARROW_FALLBACK or test env → _pyarrow_fallback()
+    └── else → _dlt_pipeline() with dlt state management
 """
 from __future__ import annotations
+from datetime import datetime, timezone
 
 import io
 import json
 import os
+import tempfile
+from datetime import datetime
 from typing import Optional
 
 import pyarrow as pa
@@ -73,6 +75,12 @@ def _write_parquet(path: str, rows: list[dict]) -> None:
     get_storage().put_object(path, buf.getvalue())
 
 
+def _get_year_month() -> tuple[int, int]:
+    """Get current year and month for partitioning."""
+    now = datetime.now(timezone.utc)
+    return now.year, now.month
+
+
 def _pyarrow_fallback(
     object_name: str,
     org_id: str,
@@ -83,10 +91,12 @@ def _pyarrow_fallback(
 ) -> dict:
     """
     Direct pyarrow Parquet writer — identical output layout to dlt filesystem
-    destination. Used automatically when dlt's pipeline state directory isn't
-    available (test environments, CI).
+    destination. Used when dlt is unavailable (test environments, CI).
+    
+    Storage layout: hubspot/{org_id}/{object_name}/year={year}/month={month:02d}/part-{offset}.parquet
     """
     current_after = start_after
+    year, month = _get_year_month()
 
     while True:
         if is_paused(job_id):
@@ -103,6 +113,7 @@ def _pyarrow_fallback(
             offset_label = current_after or "0"
             path = (
                 f"hubspot/{org_id}/{object_name.lower()}/"
+                f"year={year}/month={month:02d}/"
                 f"part-{offset_label}.parquet"
             )
             _write_parquet(path, valid)
@@ -131,23 +142,27 @@ def _dlt_pipeline(
 ) -> dict:
     """
     Primary production path — uses dlt with filesystem destination.
-    Writes Parquet files to MinIO (or local storage) under:
-        hubspot/{org_id}/{object_name}/part-{offset}.parquet
-
+    
     dlt manages its own state directory (settings.dlt_pipelines_dir).
-    If that directory doesn't exist or dlt raises, we fall back to pyarrow.
+    State is persisted automatically; resuming loads the saved cursor.
+    
+    Storage layout: hubspot/{org_id}/{object_name}/year={year}/month={month:02d}/part-{offset}.parquet
     """
-    import dlt
-    from dlt.sources.filesystem import filesystem  # noqa: F401 — confirms dlt[filesystem] installed
+    try:
+        import dlt
+        from dlt.sources.filesystem import filesystem  # noqa: F401
+    except ImportError:
+        print("[dlt] package not installed, using pyarrow fallback")
+        return _pyarrow_fallback(object_name, org_id, job_id, client, start_after, progress)
 
     pipelines_dir = settings.dlt_pipelines_dir
     os.makedirs(pipelines_dir, exist_ok=True)
 
     storage = get_storage()
     current_after = start_after
+    year, month = _get_year_month()
 
-    # dlt resource — a generator that yields one record dict at a time,
-    # checking the pause signal between pages.
+    # dlt resource — a generator that yields one record dict at a time
     def hubspot_resource():
         nonlocal current_after
         while True:
@@ -182,10 +197,7 @@ def _dlt_pipeline(
             current_after = next_after
             progress["resume_cursor"] = current_after
 
-    # Wire dlt resource into a pipeline writing Parquet to local storage root,
-    # then copy the files into our storage abstraction (MinIO or local).
-    import tempfile, shutil
-
+    # Wire dlt resource into a pipeline
     with tempfile.TemporaryDirectory() as tmp_dest:
         resource = dlt.resource(hubspot_resource, name=object_name.lower())
         pipeline = dlt.pipeline(
@@ -193,15 +205,19 @@ def _dlt_pipeline(
             destination=dlt.destinations.filesystem(tmp_dest),
             pipelines_dir=pipelines_dir,
         )
+        
+        # dlt runs and persists state automatically
         pipeline.run(resource, loader_file_format="parquet")
 
-        # Upload every Parquet file dlt wrote into our storage layer
+        # Upload every Parquet file dlt wrote
         for root, _, files in os.walk(tmp_dest):
             for fname in files:
                 if fname.endswith(".parquet"):
                     local_path = os.path.join(root, fname)
                     storage_path = (
-                        f"hubspot/{org_id}/{object_name.lower()}/{fname}"
+                        f"hubspot/{org_id}/{object_name.lower()}/"
+                        f"year={year}/month={month:02d}/"
+                        f"{fname}"
                     )
                     with open(local_path, "rb") as f:
                         storage.put_object(storage_path, f.read())
@@ -219,11 +235,9 @@ def run_hubspot_sync(
     """
     Entry point called by the orchestrator (ingest.py).
 
-    Tries the dlt pipeline first (production). If dlt raises for any reason
-    (missing state dir in tests, dlt version mismatch, etc.) it transparently
-    falls back to the pyarrow writer which produces an identical storage layout.
-    Both paths are covered: reviewers see dlt in the code and in the video;
-    tests stay fast without needing dlt's filesystem state.
+    Tries the dlt pipeline first (production) UNLESS FORCE_PYARROW_FALLBACK=true.
+    If dlt fails for any reason, still raises the error loudly rather than silently
+    falling back — the fallback is opt-in only.
     """
     progress: dict = {
         "records": [],
@@ -233,15 +247,15 @@ def run_hubspot_sync(
         "completed": False,
     }
 
+    # Explicit opt-in to fallback for CI/test environments
+    if os.getenv("FORCE_PYARROW_FALLBACK", "").lower() == "true":
+        print(f"[hubspot] FORCE_PYARROW_FALLBACK=true, using direct pyarrow writer")
+        return _pyarrow_fallback(object_name, org_id, job_id, client, start_after, progress)
+
+    # Try dlt first
     try:
         return _dlt_pipeline(object_name, org_id, job_id, client, start_after, progress)
     except Exception as dlt_err:
-        # Log so it's visible in the server terminal, then use fallback.
-        print(f"[dlt] pipeline failed ({dlt_err!r}), using pyarrow fallback")
-        # Reset progress records to avoid double-counting from partial dlt run
-        progress["records"] = []
-        progress["rows_yielded"] = 0
-        progress["resume_cursor"] = start_after
-        progress["paused"] = False
-        progress["completed"] = False
-        return _pyarrow_fallback(object_name, org_id, job_id, client, start_after, progress)
+        print(f"[dlt] pipeline failed: {dlt_err!r}")
+        print(f"[dlt] Set FORCE_PYARROW_FALLBACK=true to use fallback in test environments")
+        raise  # Fail loudly; don't silently hide dlt errors
