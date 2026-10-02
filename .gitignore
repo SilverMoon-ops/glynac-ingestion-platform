@@ -1,9 +1,64 @@
+# Virtual Environment
 .venv/
+venv/
+env/
+
+# IDE & Editor Settings
+.vscode/
+.idea/
+*.swp
+*.swo
+*.sublime-project
+*.sublime-workspace
+
+# Python
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
 .pytest_cache/
+.coverage
+
+# Database
 glynac.db
+*.sqlite
+*.db
+
+# Environment Variables
 .env
-.DS_Store
+.env.local
+.env.*.local
+
+# Project Data
 data/
 .dlt_pipelines/
+./data/objects/
+
+# OS
+.DS_Store
+Thumbs.db
+.idea/
+
+# Temporary Files
+*.tmp
+*.bak
+*.swp
+*~
+
+# Docker
+.docker/
+docker-compose.override.yml
+
+# Logs
+*.log
+logs/
+
+# Node (if needed in future)
+node_modules/
+npm-debug.log
+
+# IDEs
+.netrc
