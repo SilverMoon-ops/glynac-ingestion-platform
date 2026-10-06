@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.security import require_signed_request
-from app.models import Job, JobStatus, AuditLog
+from app.models import Job, JobStatus, AuditLog, DeadLetter
 from app.schemas import JobOut, AuditLogOut
 from app.jobs import get_job_or_404, transition
 
@@ -27,6 +27,25 @@ def list_jobs(
     return query.order_by(Job.created_at.desc()).all()
 
 
+@router.get("/stats")
+def get_jobs_stats(db: Session = Depends(get_db)):
+    """Summary metrics across all ingestion services for monitoring dashboards."""
+    jobs = db.query(Job).all()
+    by_service = {}
+    by_status = {}
+    total_rows = 0
+    for j in jobs:
+        by_service[j.service] = by_service.get(j.service, 0) + 1
+        by_status[j.status] = by_status.get(j.status, 0) + 1
+        total_rows += (j.row_count or 0)
+    return {
+        "total_jobs": len(jobs),
+        "total_rows_extracted": total_rows,
+        "by_service": by_service,
+        "by_status": by_status,
+    }
+
+
 @router.get("/{job_id}", response_model=JobOut)
 def get_status(job_id: str, db: Session = Depends(get_db)):
     return get_job_or_404(db, job_id)
@@ -41,6 +60,13 @@ def get_audit_trail(job_id: str, db: Session = Depends(get_db)):
         .order_by(AuditLog.created_at.asc())
         .all()
     )
+
+
+@router.get("/{job_id}/dead_letters")
+def get_dead_letters(job_id: str, db: Session = Depends(get_db)):
+    get_job_or_404(db, job_id)
+    dls = db.query(DeadLetter).filter(DeadLetter.job_id == job_id).all()
+    return [{"id": dl.id, "reason": dl.reason, "record": dl.record, "created_at": dl.created_at} for dl in dls]
 
 
 @router.post("/{job_id}/pause", response_model=JobOut)

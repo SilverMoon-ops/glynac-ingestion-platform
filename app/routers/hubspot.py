@@ -193,14 +193,4 @@ def browse_landed_files(object_name: Optional[str] = None):
 @router.get("/clickhouse/{object_name}")
 def inspect_clickhouse_table(object_name: str):
     sink = get_clickhouse_sink()
-    if hasattr(sink, "inserted"):  # NullClickHouseSink
-        rows = sink.inserted.get(object_name, [])
-        distinct_ids = len({r["id"] for r in rows if "id" in r})
-        return {
-            "mode": "in-memory (ClickHouse disabled)",
-            "object_name": object_name,
-            "row_count": len(rows),
-            "distinct_ids": distinct_ids,
-            "sample": rows[:5],
-        }
-    return {"mode": "live", "table": sink._table_name(object_name)}  # noqa: SLF001
+    return sink.inspect_table(object_name, service="hubspot")

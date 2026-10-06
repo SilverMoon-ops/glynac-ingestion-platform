@@ -48,9 +48,10 @@ def run_hubspot_ingestion(
 
         if valid_records:
             sink = get_clickhouse_sink()
-            sink.ensure_table(object_name, HUBSPOT_SCHEMAS[object_name])
-            sink.insert_rows(object_name, valid_records)
-            sink.ensure_view(object_name)
+            sink.ensure_table(object_name, HUBSPOT_SCHEMAS[object_name], service="hubspot")
+            sink.insert_rows(object_name, valid_records, service="hubspot")
+            sink.ensure_view(object_name, service="hubspot")
+            sink.ensure_analytical_views()
 
         cursor_payload = {
             "resume_cursor": progress.get("resume_cursor"),

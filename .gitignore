@@ -62,3 +62,13 @@ npm-debug.log
 
 # IDEs
 .netrc
+
+# Ignore SQLite temporary WAL and SHM files
+*.db-wal
+*.db-shm
+
+# Optional: Ignore the main SQLite database if it's just for local development
+*.db
+*.sqlite
+*.sqlite3
+

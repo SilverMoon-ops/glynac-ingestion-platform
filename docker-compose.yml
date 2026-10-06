@@ -10,13 +10,18 @@ services:
       minio:
         condition: service_healthy
       clickhouse:
-        condition: service_started
+        condition: service_healthy
+    env_file:
+      - .env
     environment:
       STORAGE_BACKEND: minio
-      CLICKHOUSE_ENABLED: true
-      HMAC_SECRET: local-dev-secret-change-in-prod
-      SALESFORCE_MOCK_ENABLED: true
-      HUBSPOT_MOCK_ENABLED: true
+      CLICKHOUSE_ENABLED: "true"
+      MINIO_ENDPOINT: minio:9000
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: 8123
+      DATABASE_URL: sqlite:///data/glynac.db
+      SALESFORCE_MOCK_ENABLED: "true"
+      HUBSPOT_MOCK_ENABLED: "true"
     volumes:
       - ./data:/app/data
       - ./.dlt_pipelines:/app/.dlt_pipelines
@@ -38,8 +43,8 @@ services:
       - minio_data:/data
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
-      interval: 10s
-      timeout: 5s
+      interval: 5s
+      timeout: 3s
       retries: 5
     networks:
       - glynac-network
@@ -56,6 +61,11 @@ services:
       CLICKHOUSE_DB: glynac
     volumes:
       - clickhouse_data:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
     ulimits:
       nofile:
         soft: 262144

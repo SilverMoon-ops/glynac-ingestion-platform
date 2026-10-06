@@ -90,13 +90,8 @@ def browse_landed_files(object_name: Optional[str] = None):
 @router.get("/clickhouse/{object_name}")
 def inspect_clickhouse_table(object_name: str):
     """
-    'Inspect ClickHouse Table' action. With CLICKHOUSE_ENABLED=false (the
-    local-dev default) this reports what the NullClickHouseSink recorded
-    in-memory instead of a live query, so the endpoint is still usable
-    without Docker running.
+    'Inspect ClickHouse Table' action. Returns table schema, live or mock row count,
+    and sample rows for both ClickHouse-enabled and in-memory modes.
     """
     sink = get_clickhouse_sink()
-    if hasattr(sink, "inserted"):  # NullClickHouseSink
-        rows = sink.inserted.get(object_name, [])
-        return {"mode": "in-memory (ClickHouse disabled)", "object_name": object_name, "row_count": len(rows), "sample": rows[:5]}
-    return {"mode": "live", "table": sink._table_name(object_name)}  # noqa: SLF001
+    return sink.inspect_table(object_name, service="salesforce")

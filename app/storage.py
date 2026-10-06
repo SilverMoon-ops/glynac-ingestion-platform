@@ -2,12 +2,27 @@
 Storage abstraction so the ingestion code doesn't care whether files land in
 real MinIO or, for local dev/testing without Docker, a plain folder laid out
 the same way MinIO would organize them. Switch via STORAGE_BACKEND in .env.
+
+Includes automatic endpoint liveness check: if STORAGE_BACKEND=minio but Docker
+is not running, it falls back to LocalFileStorage instantly without hanging.
 """
 from io import BytesIO
 from pathlib import Path
+import socket
 from typing import List, Protocol
 
 from app.config import settings
+
+
+def _is_endpoint_alive(endpoint: str, timeout: float = 0.5) -> bool:
+    try:
+        parts = endpoint.split(":", 1)
+        host = parts[0]
+        port = int(parts[1]) if len(parts) > 1 else 80
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except (socket.timeout, ConnectionRefusedError, OSError):
+        return False
 
 
 class ObjectStorage(Protocol):
@@ -76,13 +91,21 @@ def get_storage() -> ObjectStorage:
         return _storage_instance
 
     if settings.storage_backend == "minio":
-        _storage_instance = MinioStorage(
-            endpoint=settings.minio_endpoint,
-            access_key=settings.minio_access_key,
-            secret_key=settings.minio_secret_key,
-            bucket=settings.minio_bucket,
-            secure=settings.minio_secure,
-        )
+        if _is_endpoint_alive(settings.minio_endpoint, timeout=0.5):
+            try:
+                _storage_instance = MinioStorage(
+                    endpoint=settings.minio_endpoint,
+                    access_key=settings.minio_access_key,
+                    secret_key=settings.minio_secret_key,
+                    bucket=settings.minio_bucket,
+                    secure=settings.minio_secure,
+                )
+            except Exception as exc:
+                print(f"[STORAGE] MinIO init failed ({exc}), falling back to LocalFileStorage")
+                _storage_instance = LocalFileStorage(settings.local_storage_root)
+        else:
+            print(f"[STORAGE] MinIO endpoint {settings.minio_endpoint} is unreachable (Docker not running). Falling back to LocalFileStorage at {settings.local_storage_root}")
+            _storage_instance = LocalFileStorage(settings.local_storage_root)
     else:
         _storage_instance = LocalFileStorage(settings.local_storage_root)
     return _storage_instance
