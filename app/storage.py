@@ -12,6 +12,7 @@ import socket
 from typing import List, Protocol
 
 from app.config import settings
+from app.errors import InfrastructureUnavailable
 
 
 def _is_endpoint_alive(endpoint: str, timeout: float = 0.5) -> bool:
@@ -91,21 +92,21 @@ def get_storage() -> ObjectStorage:
         return _storage_instance
 
     if settings.storage_backend == "minio":
-        if _is_endpoint_alive(settings.minio_endpoint, timeout=0.5):
-            try:
-                _storage_instance = MinioStorage(
-                    endpoint=settings.minio_endpoint,
-                    access_key=settings.minio_access_key,
-                    secret_key=settings.minio_secret_key,
-                    bucket=settings.minio_bucket,
-                    secure=settings.minio_secure,
-                )
-            except Exception as exc:
-                print(f"[STORAGE] MinIO init failed ({exc}), falling back to LocalFileStorage")
-                _storage_instance = LocalFileStorage(settings.local_storage_root)
-        else:
-            print(f"[STORAGE] MinIO endpoint {settings.minio_endpoint} is unreachable (Docker not running). Falling back to LocalFileStorage at {settings.local_storage_root}")
-            _storage_instance = LocalFileStorage(settings.local_storage_root)
+        if not _is_endpoint_alive(settings.minio_endpoint, timeout=1.0):
+            raise InfrastructureUnavailable(
+                f"MinIO at {settings.minio_endpoint} is unreachable. Start it (docker compose up -d) "
+                f"or set STORAGE_BACKEND=local for development without Docker."
+            )
+        try:
+            _storage_instance = MinioStorage(
+                endpoint=settings.minio_endpoint,
+                access_key=settings.minio_access_key,
+                secret_key=settings.minio_secret_key,
+                bucket=settings.minio_bucket,
+                secure=settings.minio_secure,
+            )
+        except Exception as exc:
+            raise InfrastructureUnavailable(f"MinIO at {settings.minio_endpoint} rejected the connection: {exc}") from exc
     else:
         _storage_instance = LocalFileStorage(settings.local_storage_root)
     return _storage_instance

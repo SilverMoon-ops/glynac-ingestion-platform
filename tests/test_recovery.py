@@ -1,4 +1,7 @@
 """Persistent pause/cancel and startup crash recovery (all three services)."""
+import json
+from app.hubspot.ingest import run_hubspot_ingestion
+from app.hubspot.mock_server import MockHubSpotClient
 from app.control import BOOT_ID, get_control, set_control
 from app.jobs import create_job
 from app.models import AuditLog, Job, JobStatus
@@ -95,19 +98,74 @@ def _recover_twice_and_list_files(db_session):
     return first, sorted(get_storage().list_objects("hubspot/"))
 
 
-def test_recovered_hubspot_run_has_no_duplicate_files_pyarrow_path(db_session, monkeypatch):
-    """Deterministic part-file names: a re-run overwrites, never duplicates."""
-    monkeypatch.setenv("FORCE_PYARROW_FALLBACK", "true")
+import pytest
+
+
+@pytest.mark.parametrize("pyarrow_path", [True, False], ids=["pyarrow", "dlt"])
+def test_recovered_hubspot_run_has_no_duplicate_files(db_session, monkeypatch, pyarrow_path):
+    """Deterministic part-file names: a re-run overwrites, never duplicates (dlt path too)."""
+    if pyarrow_path:
+        monkeypatch.setenv("FORCE_PYARROW_FALLBACK", "true")
+    else:
+        monkeypatch.delenv("FORCE_PYARROW_FALLBACK", raising=False)
     first, second = _recover_twice_and_list_files(db_session)
     assert first and second == first
 
 
-import pytest
+class _DiesAfterPages(MockHubSpotClient):
+    """Simulates the process being killed: SystemExit is not caught by the job's `except Exception`."""
+
+    def __init__(self, die_after_pages, **kw):
+        super().__init__(**kw)
+        self.die_after_pages = die_after_pages
+        self.served = 0
+
+    def fetch_page(self, object_name, after, org_id="org1"):
+        if self.served >= self.die_after_pages:
+            raise SystemExit("simulated kill -9")
+        self.served += 1
+        return super().fetch_page(object_name, after, org_id)
 
 
-@pytest.mark.xfail(strict=True, reason="KNOWN GAP (step 3b): the default dlt path writes a new timestamp-named "
-                   "Parquet file per run, so a re-run leaves duplicate files in storage.")
-def test_recovered_hubspot_run_has_no_duplicate_files_dlt_path(db_session, monkeypatch):
-    monkeypatch.delenv("FORCE_PYARROW_FALLBACK", raising=False)
-    first, second = _recover_twice_and_list_files(db_session)
-    assert second == first
+def test_midrun_crash_resumes_from_last_page_without_double_counting(db_session, monkeypatch):
+    monkeypatch.setenv("FORCE_PYARROW_FALLBACK", "true")
+    job = create_job(db_session, service="hubspot", object_name="Companies", org_id="org1")
+    dying = _DiesAfterPages(2, page_size=10, total_records=47, latency_seconds=0)
+    with pytest.raises(SystemExit):
+        run_hubspot_ingestion(job.id, "Companies", "org1", client=dying)
+
+    db_session.expire_all()
+    crashed = db_session.query(Job).get(job.id)
+    assert crashed.status == JobStatus.RUNNING.value  # left orphaned, like a real kill
+    assert crashed.row_count == 20 and json.loads(crashed.cursor)["resume_cursor"] == "20"
+    landed_before = set(get_storage().list_objects("hubspot/"))
+    assert len(landed_before) == 2  # the two finished pages are already in storage
+
+    crashed.owner = "dead-process"  # it belonged to the process that died
+    db_session.add(crashed)
+    db_session.commit()
+    assert recover_interrupted_jobs(dispatch=lambda fn: fn()) == [job.id]
+
+    db_session.expire_all()
+    done = db_session.query(Job).get(job.id)
+    assert done.status == JobStatus.COMPLETED.value
+    assert done.row_count == 47  # not 47 + 20
+    files = get_storage().list_objects("hubspot/")
+    assert len(files) == 5 and landed_before <= set(files)  # 5 pages, none duplicated
+
+
+def test_crash_after_last_page_checkpoint_is_finalised_not_rerun(db_session, monkeypatch):
+    monkeypatch.setenv("FORCE_PYARROW_FALLBACK", "true")
+    job = create_job(db_session, service="hubspot", object_name="Companies", org_id="org1")
+    run_hubspot_ingestion(job.id, "Companies", "org1")
+    db_session.expire_all()
+    j = db_session.query(Job).get(job.id)
+    j.status, j.owner = JobStatus.RUNNING.value, "dead-process"  # died just before COMPLETED
+    db_session.add(j)
+    db_session.commit()
+
+    recover_interrupted_jobs(dispatch=lambda fn: fn())
+    db_session.expire_all()
+    j = db_session.query(Job).get(job.id)
+    assert j.status == JobStatus.COMPLETED.value
+    assert j.row_count == 47

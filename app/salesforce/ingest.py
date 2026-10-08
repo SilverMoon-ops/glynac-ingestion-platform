@@ -29,6 +29,7 @@ from app.salesforce.real_client import (
 from app.salesforce.schemas import SALESFORCE_SCHEMAS, validate_records
 from app.salesforce.queries import SALESFORCE_QUERIES
 from app.config import settings
+from app.errors import ConfigurationError
 from app.control import CANCEL, PAUSE, claim_job, clear_control, get_control
 
 
@@ -61,6 +62,29 @@ def _get_results_with_retry(client, bulk_job_id: str, org_id: str = "org1"):
     else:
         # Mock client returns list[dict]
         return results
+
+
+def _make_client(object_name: str):
+    """
+    Choose the client explicitly. SALESFORCE_MOCK_ENABLED=true -> mock.
+    Otherwise real credentials are REQUIRED and any auth failure fails the job;
+    it never quietly falls back to fake data.
+    """
+    if settings.salesforce_mock_enabled:
+        print(f"[SALESFORCE] Using mock client for {object_name}")
+        return MockSalesforceClient()
+    if not (settings.salesforce_client_id and settings.salesforce_client_secret):
+        raise ConfigurationError(
+            "SALESFORCE_MOCK_ENABLED=false but SALESFORCE_CLIENT_ID / SALESFORCE_CLIENT_SECRET are not set."
+        )
+    oauth = SalesforceOAuth2Client(
+        client_id=settings.salesforce_client_id,
+        client_secret=settings.salesforce_client_secret,
+        instance_url=settings.salesforce_instance_url,
+    )
+    oauth.authenticate()  # raises on bad credentials
+    print(f"[SALESFORCE] Using real Bulk API v2 for {object_name}")
+    return SalesforceBulkAPIv2Client(oauth)
 
 
 def _stop_requested(db, job_id: str) -> bool:
@@ -98,29 +122,10 @@ def run_salesforce_ingestion(
     """
     db = SessionLocal()
     
-    # Instantiate client if not provided (for testing)
-    if client is None:
-        if settings.salesforce_client_id and not settings.salesforce_mock_enabled:
-            # Use real Salesforce
-            oauth = SalesforceOAuth2Client(
-                client_id=settings.salesforce_client_id,
-                client_secret=settings.salesforce_client_secret,
-                instance_url=settings.salesforce_instance_url,
-            )
-            try:
-                oauth.authenticate()
-                client = SalesforceBulkAPIv2Client(oauth)
-                print(f"[SALESFORCE] Using real Bulk API v2 for {object_name}")
-            except Exception as e:
-                print(f"[SALESFORCE] Real client failed ({e}), falling back to mock")
-                client = MockSalesforceClient()
-        else:
-            # Use mock
-            client = MockSalesforceClient()
-            print(f"[SALESFORCE] Using mock client for {object_name}")
-    
     try:
         job = get_job_or_404(db, job_id)
+        if client is None:
+            client = _make_client(object_name)
         if job.status != JobStatus.RUNNING.value:
             job = transition(db, job, JobStatus.RUNNING)
         claim_job(job_id)

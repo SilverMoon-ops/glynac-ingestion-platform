@@ -1,14 +1,19 @@
 """
-HubSpot ingestion pipeline — BE-2.
+HubSpot ingestion pipeline - BE-2.
 
-Primary production path uses `dlt` with filesystem destination writing Parquet files.
-If FORCE_PYARROW_FALLBACK=true or dlt is not available in test environment,
-falls back to direct pyarrow for identical output layout.
+Work is done one page at a time, and each page is a unit of recovery:
 
-Architecture:
-  run_hubspot_sync()
-    ├── if FORCE_PYARROW_FALLBACK or test env → _pyarrow_fallback()
-    └── else → _dlt_pipeline() with dlt state management
+  1. fetch page (retry/backoff on 429s)
+  2. land it as ONE Parquet file whose name is derived from the page cursor,
+     so re-landing the same page overwrites the file instead of adding a copy
+  3. hand the page to `on_page` (ClickHouse load + durable checkpoint)
+
+A crash therefore loses at most the page in flight, and replaying it is
+idempotent. The Parquet is produced by `dlt` (filesystem destination) by
+default; FORCE_PYARROW_FALLBACK=true uses pyarrow directly with the same
+file layout, for CI.
+
+Layout: hubspot/{org}/{object}/year=YYYY/month=MM/part-{cursor}.parquet
 """
 from __future__ import annotations
 from datetime import datetime, timezone
@@ -18,7 +23,7 @@ import json
 import os
 import tempfile
 from datetime import datetime
-from typing import Optional
+from typing import Callable, Optional
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -81,148 +86,46 @@ def _get_year_month() -> tuple[int, int]:
     return now.year, now.month
 
 
-def _pyarrow_fallback(
-    object_name: str,
-    org_id: str,
-    job_id: str,
-    client: MockHubSpotClient,
-    start_after: Optional[str],
-    progress: dict,
-) -> dict:
-    """
-    Direct pyarrow Parquet writer — identical output layout to dlt filesystem
-    destination. Used when dlt is unavailable (test environments, CI).
-    
-    Storage layout: hubspot/{org_id}/{object_name}/year={year}/month={month:02d}/part-{offset}.parquet
-    """
-    current_after = start_after
-    year, month = _get_year_month()
-
-    while True:
-        if is_paused(job_id):
-            progress["paused"] = True
-            progress["resume_cursor"] = current_after
-            return progress
-
-        page = _fetch_page_with_retry(client, object_name, current_after, org_id)
-        results = page.get("results", [])
-        progress["records"].extend(results)
-
-        valid = [r for r in results if r.get("id")]
-        if valid:
-            offset_label = current_after or "0"
-            path = (
-                f"hubspot/{org_id}/{object_name.lower()}/"
-                f"year={year}/month={month:02d}/"
-                f"part-{offset_label}.parquet"
-            )
-            _write_parquet(path, valid)
-
-        progress["rows_yielded"] += len(results)
-
-        paging = page.get("paging")
-        next_after = paging["next"]["after"] if paging else None
-
-        if next_after is None:
-            progress["completed"] = True
-            progress["resume_cursor"] = None
-            return progress
-
-        current_after = next_after
-        progress["resume_cursor"] = current_after
+def _normalise(record: dict) -> dict:
+    """Make values safe for Arrow / dlt schema inference."""
+    return {
+        k: (int(v) if isinstance(v, bool) else v.isoformat() if hasattr(v, "isoformat") else v)
+        for k, v in record.items()
+    }
 
 
-def _dlt_pipeline(
-    object_name: str,
-    org_id: str,
-    job_id: str,
-    client: MockHubSpotClient,
-    start_after: Optional[str],
-    progress: dict,
-) -> dict:
-    """
-    Primary production path — uses dlt with filesystem destination.
-    
-    dlt manages its own state directory (settings.dlt_pipelines_dir).
-    State is persisted automatically; resuming loads the saved cursor.
-    
-    Storage layout: hubspot/{org_id}/{object_name}/year={year}/month={month:02d}/part-{offset}.parquet
-    """
+def _land_page_pyarrow(base_path: str, rows: list[dict]) -> None:
+    _write_parquet(f"{base_path}.parquet", rows)
+
+
+def _land_page_dlt(base_path: str, object_name: str, rows: list[dict]) -> None:
+    """Run one dlt load for this page and store its Parquet under a deterministic name."""
     try:
         import dlt
-        from dlt.sources.filesystem import filesystem  # noqa: F401
-    except ImportError:
-        print("[dlt] package not installed, using pyarrow fallback")
-        return _pyarrow_fallback(object_name, org_id, job_id, client, start_after, progress)
+    except ImportError as exc:  # fail loudly; the pyarrow path is opt-in only
+        raise RuntimeError("dlt is not installed. Install it or set FORCE_PYARROW_FALLBACK=true.") from exc
 
-    pipelines_dir = settings.dlt_pipelines_dir
-    os.makedirs(pipelines_dir, exist_ok=True)
-
+    table = object_name.lower()
     storage = get_storage()
-    current_after = start_after
-    year, month = _get_year_month()
-
-    # dlt resource — a generator that yields one record dict at a time
-    def hubspot_resource():
-        nonlocal current_after
-        while True:
-            if is_paused(job_id):
-                progress["paused"] = True
-                progress["resume_cursor"] = current_after
-                return  # stops the generator; dlt flushes whatever it has
-
-            page = _fetch_page_with_retry(client, object_name, current_after, org_id)
-            results = page.get("results", [])
-            progress["records"].extend(results)
-
-            for record in results:
-                if record.get("id"):
-                    # Normalise bools and datetimes for dlt schema inference
-                    yield {
-                        k: (int(v) if isinstance(v, bool)
-                            else v.isoformat() if hasattr(v, "isoformat")
-                            else v)
-                        for k, v in record.items()
-                    }
-
-            progress["rows_yielded"] += len(results)
-            paging = page.get("paging")
-            next_after = paging["next"]["after"] if paging else None
-
-            if next_after is None:
-                progress["completed"] = True
-                progress["resume_cursor"] = None
-                return
-
-            current_after = next_after
-            progress["resume_cursor"] = current_after
-
-    # Wire dlt resource into a pipeline
-    with tempfile.TemporaryDirectory() as tmp_dest:
-        resource = dlt.resource(hubspot_resource, name=object_name.lower())
+    # Throw-away dirs: the job row in the database is the durable checkpoint,
+    # so dlt's own state directory is not needed (and would only accumulate).
+    with tempfile.TemporaryDirectory() as dest, tempfile.TemporaryDirectory() as state:
         pipeline = dlt.pipeline(
-            pipeline_name=f"hubspot_{object_name.lower()}_{job_id[:8]}",
-            destination=dlt.destinations.filesystem(tmp_dest),
-            pipelines_dir=pipelines_dir,
+            pipeline_name=f"hubspot_{table}",
+            destination=dlt.destinations.filesystem(dest),
+            pipelines_dir=state,
         )
-        
-        # dlt runs and persists state automatically
-        pipeline.run(resource, loader_file_format="parquet")
-
-        # Upload every Parquet file dlt wrote
-        for root, _, files in os.walk(tmp_dest):
-            for fname in files:
-                if fname.endswith(".parquet"):
-                    local_path = os.path.join(root, fname)
-                    storage_path = (
-                        f"hubspot/{org_id}/{object_name.lower()}/"
-                        f"year={year}/month={month:02d}/"
-                        f"{fname}"
-                    )
-                    with open(local_path, "rb") as f:
-                        storage.put_object(storage_path, f.read())
-
-    return progress
+        pipeline.run(dlt.resource(rows, name=table), loader_file_format="parquet")
+        files = sorted(
+            os.path.join(root, f)
+            for root, _, names in os.walk(dest)
+            if os.path.basename(root) == table
+            for f in names
+            if f.endswith(".parquet")
+        )
+        for i, local in enumerate(files):
+            with open(local, "rb") as fh:
+                storage.put_object(f"{base_path}{'' if i == 0 else f'-{i}'}.parquet", fh.read())
 
 
 def run_hubspot_sync(
@@ -231,31 +134,60 @@ def run_hubspot_sync(
     job_id: str,
     client: MockHubSpotClient,
     start_after: Optional[str] = None,
+    on_page: Optional[Callable[[Optional[str], list], None]] = None,
+    partition: Optional[tuple[int, int]] = None,
 ) -> dict:
     """
-    Entry point called by the orchestrator (ingest.py).
+    Entry point called by ingest.py.
 
-    Tries the dlt pipeline first (production) UNLESS FORCE_PYARROW_FALLBACK=true.
-    If dlt fails for any reason, still raises the error loudly rather than silently
-    falling back — the fallback is opt-in only.
+    `on_page(next_cursor, page_results)` runs after each page has landed and is
+    where the caller loads ClickHouse and persists the checkpoint. `partition`
+    is the (year, month) used in the file path; the caller derives it from the
+    job's creation time so a run resumed after a restart (even across a month
+    boundary) writes to the same paths.
     """
     progress: dict = {
-        "records": [],
         "rows_yielded": 0,
+        "pages": 0,
         "resume_cursor": start_after,
         "paused": False,
         "completed": False,
     }
+    use_pyarrow = os.getenv("FORCE_PYARROW_FALLBACK", "").lower() == "true"
+    if use_pyarrow:
+        print("[hubspot] FORCE_PYARROW_FALLBACK=true, using direct pyarrow writer")
+    year, month = partition or _get_year_month()
+    current = start_after
 
-    # Explicit opt-in to fallback for CI/test environments
-    if os.getenv("FORCE_PYARROW_FALLBACK", "").lower() == "true":
-        print(f"[hubspot] FORCE_PYARROW_FALLBACK=true, using direct pyarrow writer")
-        return _pyarrow_fallback(object_name, org_id, job_id, client, start_after, progress)
+    while True:
+        if is_paused(job_id):
+            progress["paused"] = True
+            progress["resume_cursor"] = current
+            return progress
 
-    # Try dlt first
-    try:
-        return _dlt_pipeline(object_name, org_id, job_id, client, start_after, progress)
-    except Exception as dlt_err:
-        print(f"[dlt] pipeline failed: {dlt_err!r}")
-        print(f"[dlt] Set FORCE_PYARROW_FALLBACK=true to use fallback in test environments")
-        raise  # Fail loudly; don't silently hide dlt errors
+        page = _fetch_page_with_retry(client, object_name, current, org_id)
+        results = page.get("results", [])
+        landable = [_normalise(r) for r in results if r.get("id")]
+        if landable:
+            base = (
+                f"hubspot/{org_id}/{object_name.lower()}/"
+                f"year={year}/month={month:02d}/part-{current or '0'}"
+            )
+            if use_pyarrow:
+                _land_page_pyarrow(base, landable)
+            else:
+                _land_page_dlt(base, object_name, landable)
+
+        paging = page.get("paging")
+        next_after = paging["next"]["after"] if paging else None
+        if on_page:
+            on_page(next_after, results)  # ClickHouse load + checkpoint (idempotent if replayed)
+
+        progress["rows_yielded"] += len(results)
+        progress["pages"] += 1
+        if next_after is None:
+            progress["completed"] = True
+            progress["resume_cursor"] = None
+            return progress
+        current = next_after
+        progress["resume_cursor"] = current

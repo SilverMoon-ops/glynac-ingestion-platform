@@ -35,6 +35,7 @@ dialog::backdrop{background:#0008}pre{overflow:auto;max-height:50vh;background:v
 <header><h1>Glynac Ingestion Console</h1><span class="chip" id="chipStore">storage…</span><span class="chip" id="chipCH">clickhouse…</span>
 <label class="row">Org <input id="org" value="org1" size="8"></label><button id="logout">Sign out</button></header>
 <main>
+<div class="card hide" id="problems" style="border-color:var(--bad);color:var(--bad);margin-bottom:14px"></div>
 <div class="grid g4" id="stats"></div>
 
 <h2>Start ingestion</h2>
@@ -86,6 +87,7 @@ async function refresh(){
     const by=st.by_status||{};
     $("stats").innerHTML=[["Jobs",st.total_jobs],["Rows extracted",st.total_rows_extracted],["Running",by.RUNNING||0],["Failed",by.FAILED||0]]
       .map(([l,v])=>`<div class="card stat"><b>${esc(v)}</b><span>${l}</span></div>`).join("");
+    const pr=$("problems");pr.classList.toggle("hide",!(sys.problems||[]).length);pr.innerHTML=(sys.problems||[]).map(p=>"<b>Infrastructure problem:</b> "+esc(p)).join("<br>");
     $("chipStore").textContent="storage: "+sys.storage_type;$("chipCH").textContent="clickhouse: "+sys.clickhouse_mode;
     const f=$("filter").value,list=jobs.filter(j=>!f||j.service===f);
     $("jobs").innerHTML=list.length?list.map(row).join(""):`<tr><td colspan="7" class="sub">No jobs yet. Start one above.</td></tr>`;

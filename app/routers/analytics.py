@@ -7,6 +7,7 @@ from pydantic import BaseModel
 from app.security import require_signed_request
 from app.clickhouse_sink import get_clickhouse_sink
 from app.config import settings
+from app.errors import InfrastructureUnavailable
 from app.storage import get_storage
 
 router = APIRouter(
@@ -60,15 +61,23 @@ def inspect_table_or_view(target_name: str, service: Optional[str] = None):
 
 @router.get("/status")
 def system_components_status():
-    """Returns infrastructure runtime modes for the monitoring UI."""
-    storage = get_storage()
-    sink = get_clickhouse_sink()
-    is_ch_real = hasattr(sink, "client")
-
-    return {
+    """Returns infrastructure runtime modes for the monitoring UI. Never raises: an
+    unreachable service is reported as such so the operator can see why jobs fail."""
+    out = {
         "storage_backend": settings.storage_backend,
-        "storage_type": type(storage).__name__,
         "clickhouse_enabled": settings.clickhouse_enabled,
-        "clickhouse_mode": "Live ClickHouse Server" if is_ch_real else "In-Memory NullSink",
         "dlt_pipelines_dir": settings.dlt_pipelines_dir,
+        "problems": [],
     }
+    try:
+        out["storage_type"] = type(get_storage()).__name__
+    except InfrastructureUnavailable as exc:
+        out["storage_type"] = "UNREACHABLE"
+        out["problems"].append(str(exc))
+    try:
+        sink = get_clickhouse_sink()
+        out["clickhouse_mode"] = "Live ClickHouse Server" if hasattr(sink, "client") else "In-Memory NullSink (ClickHouse disabled)"
+    except InfrastructureUnavailable as exc:
+        out["clickhouse_mode"] = "UNREACHABLE"
+        out["problems"].append(str(exc))
+    return out

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional, Protocol, Tuple
 from app.config import settings
+from app.errors import InfrastructureUnavailable
 
 # Maps our internal schema type names to ClickHouse column types.
 CH_TYPE_MAP = {
@@ -381,15 +382,15 @@ def get_clickhouse_sink() -> ClickHouseSink:
         return _sink_instance
 
     if settings.clickhouse_enabled:
-        if _is_ch_alive(settings.clickhouse_host, settings.clickhouse_port, timeout=0.5):
-            try:
-                _sink_instance = RealClickHouseSink()
-            except Exception as exc:
-                print(f"[CLICKHOUSE] Connection to real ClickHouse failed ({exc}), falling back to in-memory NullSink")
-                _sink_instance = NullClickHouseSink()
-        else:
-            print(f"[CLICKHOUSE] ClickHouse at {settings.clickhouse_host}:{settings.clickhouse_port} is unreachable. Falling back to NullClickHouseSink")
-            _sink_instance = NullClickHouseSink()
+        if not _is_ch_alive(settings.clickhouse_host, settings.clickhouse_port, timeout=1.0):
+            raise InfrastructureUnavailable(
+                f"ClickHouse at {settings.clickhouse_host}:{settings.clickhouse_port} is unreachable. "
+                f"Start it (docker compose up -d) or set CLICKHOUSE_ENABLED=false for development without Docker."
+            )
+        try:
+            _sink_instance = RealClickHouseSink()
+        except Exception as exc:
+            raise InfrastructureUnavailable(f"ClickHouse rejected the connection: {exc}") from exc
     else:
         _sink_instance = NullClickHouseSink()
     return _sink_instance

@@ -9,7 +9,7 @@ from app.audit import log_audit
 # Only these transitions are legal. Anything else is rejected with a 409,
 # so a client can't e.g. "resume" a job that's already COMPLETED.
 _ALLOWED_TRANSITIONS = {
-    JobStatus.PENDING: {JobStatus.RUNNING, JobStatus.CANCELLED},
+    JobStatus.PENDING: {JobStatus.RUNNING, JobStatus.CANCELLED, JobStatus.FAILED},  # FAILED: failed before it could start (bad config, dependency down)
     JobStatus.RUNNING: {JobStatus.PAUSED, JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED},
     JobStatus.PAUSED: {JobStatus.RUNNING, JobStatus.CANCELLED},
     JobStatus.COMPLETED: set(),
@@ -42,6 +42,10 @@ def transition(db: Session, job: Job, new_status: JobStatus, detail: Optional[st
             detail=f"Cannot transition job from {current.value} to {new_status.value}.",
         )
     job.status = new_status.value
+    if new_status == JobStatus.FAILED:
+        job.error = detail
+    elif new_status == JobStatus.RUNNING:
+        job.error = None  # a resumed job starts with a clean slate
     db.add(job)
     db.commit()
     db.refresh(job)
