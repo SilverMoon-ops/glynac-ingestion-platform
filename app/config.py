@@ -11,6 +11,10 @@ class Settings:
     database_url: str = os.getenv("DATABASE_URL", "sqlite:///./glynac.db")
     signature_max_age_seconds: int = int(os.getenv("SIGNATURE_MAX_AGE_SECONDS", "300"))
 
+    # Browser console login. Empty password = console login disabled (HMAC API still works).
+    ui_password: str = os.getenv("UI_PASSWORD", "")
+    session_ttl_seconds: int = int(os.getenv("SESSION_TTL_SECONDS", "28800"))
+
     # Object storage — "local" needs nothing running and is the default so the
     # repo works before you've touched docker-compose; switch to "minio" once
     # `docker compose up -d` is running.

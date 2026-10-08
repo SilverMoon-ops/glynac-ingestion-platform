@@ -66,3 +66,16 @@ def test_realtime_event_is_idempotent(db_session):
     assert len(matching) == 1, (
         f"Expected exactly 1 file for event-001, got {len(matching)}: {matching}"
     )
+
+
+def test_slack_clickhouse_inspect_route(client):
+    """UI 'Inspect CH' button hits this route; it used to 404 for Slack jobs."""
+    from tests.conftest import sign_request
+
+    for name in ("historical", "realtime", "messages", "users"):
+        r = client.get(f"/api/slack/clickhouse/{name}", headers=sign_request())
+        assert r.status_code == 200, (name, r.text)
+        assert "table_name" in r.json()
+
+    bad = client.get("/api/slack/clickhouse/nope", headers=sign_request())
+    assert bad.status_code == 404

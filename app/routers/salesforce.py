@@ -8,6 +8,7 @@ from app.database import get_db
 from app.security import require_signed_request
 from app.jobs import create_job, get_job_or_404, transition
 from app.models import Job, JobStatus
+from app.control import CANCEL, PAUSE, clear_control, set_control
 from app.schemas import JobOut
 from app.storage import get_storage
 from app.clickhouse_sink import get_clickhouse_sink
@@ -59,17 +60,31 @@ def get_status(job_id: str, db: Session = Depends(get_db)):
 
 @router.post("/pause/{job_id}", response_model=JobOut)
 def pause_job(job_id: str, db: Session = Depends(get_db)):
-    return transition(db, get_job_or_404(db, job_id), JobStatus.PAUSED)
+    """Stored in the DB; the worker pauses at its next stage boundary."""
+    job = get_job_or_404(db, job_id)
+    if job.status != JobStatus.RUNNING.value:
+        raise HTTPException(status_code=409, detail=f"Job is {job.status}, not RUNNING - nothing to pause.")
+    set_control(job_id, PAUSE)
+    return job
 
 
 @router.post("/resume/{job_id}", response_model=JobOut)
-def resume_job(job_id: str, db: Session = Depends(get_db)):
-    return transition(db, get_job_or_404(db, job_id), JobStatus.RUNNING, detail="resumed")
+def resume_job(job_id: str, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    """Re-launches the worker; works for a paused job or a failed one."""
+    job = get_job_or_404(db, job_id)
+    if job.status not in (JobStatus.PAUSED.value, JobStatus.FAILED.value):
+        raise HTTPException(status_code=409, detail=f"Job is {job.status} - nothing to resume.")
+    clear_control(job_id)
+    job = transition(db, job, JobStatus.RUNNING, detail="resumed")
+    background_tasks.add_task(run_salesforce_ingestion, job.id, job.object_name, job.org_id or "org1")
+    return job
 
 
 @router.post("/cancel/{job_id}", response_model=JobOut)
 def cancel_job(job_id: str, db: Session = Depends(get_db)):
-    return transition(db, get_job_or_404(db, job_id), JobStatus.CANCELLED)
+    job = get_job_or_404(db, job_id)
+    set_control(job_id, CANCEL)
+    return transition(db, job, JobStatus.CANCELLED)
 
 
 @router.delete("/remove/{job_id}")

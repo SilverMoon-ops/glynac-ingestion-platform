@@ -20,6 +20,7 @@ from app.slack.engine import (
     run_historical_backfill,
     seed_metadata,
 )
+from app.clickhouse_sink import get_clickhouse_sink
 from app.storage import get_storage
 
 router = APIRouter(
@@ -189,6 +190,35 @@ def list_slack_files():
     return {
         "files": storage.list_objects("slack/")
     }
+
+
+# Slack tables are created by app/slack/engine.py under these exact names.
+SLACK_TABLES = {
+    "messages": "bronze_slack_messages",
+    "users": "slack_users",
+    "channels": "slack_channels",
+    "threads": "slack_threads",
+    "files": "slack_files",
+    "reactions": "slack_reactions",
+}
+
+
+@router.get("/clickhouse/{object_name}")
+def inspect_clickhouse_table(object_name: str):
+    """
+    Inspect a Slack ClickHouse table. The UI passes the job's object_name
+    ("historical" / "realtime"), both of which land in the messages table.
+    """
+    key = object_name.lower()
+    if key in ("historical", "realtime"):
+        key = "messages"
+    table = SLACK_TABLES.get(key)
+    if table is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Unknown Slack table '{object_name}'. Valid: {sorted(SLACK_TABLES)}",
+        )
+    return get_clickhouse_sink().inspect_table(table)
 
 
 @router.post("/realtime/event")

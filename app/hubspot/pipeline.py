@@ -27,20 +27,20 @@ from app.hubspot.mock_server import MockHubSpotClient
 from app.retry import with_retry
 from app.storage import get_storage
 from app.config import settings
+from app.control import CANCEL, PAUSE, clear_control, get_control, set_control
 
-_pause_signals: dict[str, bool] = {}
-
-
+# Pause/cancel requests are stored in the jobs table (app/control.py) so they
+# survive restarts and work across processes.
 def signal_pause(job_id: str) -> None:
-    _pause_signals[job_id] = True
+    set_control(job_id, PAUSE)
 
 
 def clear_pause_signal(job_id: str) -> None:
-    _pause_signals.pop(job_id, None)
+    clear_control(job_id)
 
 
 def is_paused(job_id: str) -> bool:
-    return _pause_signals.get(job_id, False)
+    return get_control(job_id) in (PAUSE, CANCEL)
 
 
 @with_retry

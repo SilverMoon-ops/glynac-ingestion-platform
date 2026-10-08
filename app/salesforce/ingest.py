@@ -29,6 +29,7 @@ from app.salesforce.real_client import (
 from app.salesforce.schemas import SALESFORCE_SCHEMAS, validate_records
 from app.salesforce.queries import SALESFORCE_QUERIES
 from app.config import settings
+from app.control import CANCEL, PAUSE, claim_job, clear_control, get_control
 
 
 @with_retry
@@ -60,6 +61,27 @@ def _get_results_with_retry(client, bulk_job_id: str, org_id: str = "org1"):
     else:
         # Mock client returns list[dict]
         return results
+
+
+def _stop_requested(db, job_id: str) -> bool:
+    """
+    Called between stages. Honours a pause/cancel request stored in the DB
+    (so it works across restarts) and tells the caller to stop working.
+    """
+    db.expire_all()
+    job = get_job_or_404(db, job_id)
+    if job.status in (JobStatus.CANCELLED.value, JobStatus.PAUSED.value):
+        return True
+    ctl = get_control(job_id)
+    if ctl == CANCEL:
+        transition(db, job, JobStatus.CANCELLED, detail="cancelled by operator")
+        clear_control(job_id)
+        return True
+    if ctl == PAUSE:
+        transition(db, job, JobStatus.PAUSED, detail=f"paused by operator; checkpoint={job.cursor}")
+        clear_control(job_id)
+        return True
+    return False
 
 
 def run_salesforce_ingestion(
@@ -99,7 +121,11 @@ def run_salesforce_ingestion(
     
     try:
         job = get_job_or_404(db, job_id)
-        job = transition(db, job, JobStatus.RUNNING)
+        if job.status != JobStatus.RUNNING.value:
+            job = transition(db, job, JobStatus.RUNNING)
+        claim_job(job_id)
+        if _stop_requested(db, job_id):
+            return
 
         if isinstance(client, SalesforceBulkAPIv2Client):
             client.oauth.authenticate()
@@ -116,9 +142,13 @@ def run_salesforce_ingestion(
             update_checkpoint(
                 db, job, cursor=json.dumps({"bulk_job_id": bulk_job["id"], "stage": state})
             )
+            if _stop_requested(db, job_id):
+                return
             if state not in ("JobComplete", "Completed"):
                 time.sleep(0.5)
 
+        if _stop_requested(db, job_id):
+            return
         records = _get_results_with_retry(client, bulk_job["id"], org_id)
         valid_records, invalid_records = validate_records(records)
 
@@ -133,6 +163,8 @@ def run_salesforce_ingestion(
             cursor=json.dumps({"bulk_job_id": bulk_job["id"], "stage": "landed", "path": path}),
         )
 
+        if _stop_requested(db, job_id):
+            return
         sink = get_clickhouse_sink()
         sink.ensure_table(object_name, SALESFORCE_SCHEMAS[object_name], service="salesforce")
         sink.insert_rows(object_name, valid_records, service="salesforce")

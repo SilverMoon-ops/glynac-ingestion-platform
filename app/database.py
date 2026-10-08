@@ -33,3 +33,15 @@ def init_db():
     from app import models  # noqa: F401
 
     Base.metadata.create_all(bind=engine)
+    _ensure_columns()
+
+
+def _ensure_columns():
+    """create_all never alters existing tables; add columns introduced later."""
+    from sqlalchemy import inspect, text
+
+    existing = {c["name"] for c in inspect(engine).get_columns("jobs")}
+    with engine.begin() as conn:
+        for col in ("control", "owner"):
+            if col not in existing:
+                conn.execute(text(f"ALTER TABLE jobs ADD COLUMN {col} VARCHAR"))

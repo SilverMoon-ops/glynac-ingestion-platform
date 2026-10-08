@@ -2,6 +2,7 @@ import json
 from typing import Optional
 
 from app.config import settings
+from app.control import claim_job
 from app.database import SessionLocal
 from app.jobs import get_job_or_404, transition, update_checkpoint
 from app.models import JobStatus
@@ -37,6 +38,7 @@ def run_hubspot_ingestion(
         # starts, so only transition if that hasn't happened yet.
         if job.status != JobStatus.RUNNING.value:
             job = transition(db, job, JobStatus.RUNNING, detail="resumed" if start_after else "started")
+        claim_job(job_id)
         clear_pause_signal(job_id)
 
         progress = run_hubspot_sync(object_name, org_id, job_id, client, start_after)

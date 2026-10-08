@@ -44,6 +44,8 @@ class Job(Base):
     row_count = Column(Integer, nullable=False, default=0)
     retry_count = Column(Integer, nullable=False, default=0)
     error = Column(Text, nullable=True)
+    control = Column(String, nullable=True)                  # pending pause/cancel request
+    owner = Column(String, nullable=True)                    # process instance running the job
     created_at = Column(DateTime, default=_now)
     updated_at = Column(DateTime, default=_now, onupdate=_now)
 

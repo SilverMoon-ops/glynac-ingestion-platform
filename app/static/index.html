@@ -1,973 +1,145 @@
 <!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Glynac Enterprise Ingestion Platform</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Glynac Ingestion Console</title>
 <style>
-  :root {
-    --bg: #0d1117;
-    --surface: #161b22;
-    --surface-raised: #21262d;
-    --border: #30363d;
-    --border-hover: #484f58;
-    --text: #c9d1d9;
-    --text-bright: #f0f6fc;
-    --text-muted: #8b949e;
-    --accent: #58a6ff;
-    --accent-hover: #79b8ff;
-    --success: #3fb950;
-    --warning: #d29922;
-    --danger: #f85149;
-    --purple: #bc8cff;
-    --cyan: #39c5cf;
-  }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0;
-    background: var(--bg);
-    color: var(--text);
-    font-family: 'IBM Plex Sans', -apple-system, sans-serif;
-    font-size: 13.5px;
-    line-height: 1.5;
-  }
-  .mono { font-family: 'IBM Plex Mono', monospace; }
-  
-  /* Header */
-  header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 12px 24px;
-    border-bottom: 1px solid var(--border);
-    background: var(--surface);
-    position: sticky;
-    top: 0;
-    z-index: 50;
-  }
-  .brand { display: flex; align-items: center; gap: 10px; }
-  .brand-logo {
-    width: 24px; height: 24px; border-radius: 6px;
-    background: linear-gradient(135deg, var(--accent), var(--cyan));
-    display: flex; align-items: center; justify-content: center;
-    font-weight: 700; color: #0d1117; font-size: 13px;
-  }
-  header h1 {
-    font-size: 14px;
-    font-weight: 600;
-    letter-spacing: 0.04em;
-    margin: 0;
-    color: var(--text-bright);
-  }
-  header .creds { display: flex; gap: 10px; align-items: center; }
-  input, select {
-    background: var(--surface-raised);
-    border: 1px solid var(--border);
-    color: var(--text);
-    border-radius: 6px;
-    padding: 6px 10px;
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 12px;
-    outline: none;
-    transition: border-color 0.15s;
-  }
-  input:focus, select:focus { border-color: var(--accent); }
-  input::placeholder { color: var(--text-muted); }
+:root{--bg:#f6f7f9;--card:#fff;--text:#1a1f2b;--mute:#6b7385;--line:#e3e6ec;--acc:#3b5bdb;--ok:#2b8a3e;--warn:#e67700;--bad:#c92a2a}
+@media(prefers-color-scheme:dark){:root{--bg:#10131a;--card:#181c26;--text:#e8ebf2;--mute:#8b93a7;--line:#2a3040;--acc:#7c93ff;--ok:#51cf66;--warn:#ffa94d;--bad:#ff6b6b}}
+*{box-sizing:border-box}body{margin:0;font:14px/1.45 system-ui,sans-serif;background:var(--bg);color:var(--text)}
+header{display:flex;flex-wrap:wrap;gap:12px;align-items:center;padding:12px 20px;background:var(--card);border-bottom:1px solid var(--line)}
+header h1{font-size:16px;margin:0;flex:1}main{max-width:1200px;margin:0 auto;padding:20px}
+.chip{font-size:12px;padding:2px 8px;border-radius:99px;border:1px solid var(--line);color:var(--mute)}
+.grid{display:grid;gap:14px}.g4{grid-template-columns:repeat(auto-fit,minmax(150px,1fr))}.g3{grid-template-columns:repeat(auto-fit,minmax(280px,1fr))}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px}
+.card h3{margin:0 0 4px;font-size:14px}.sub{color:var(--mute);font-size:12px;margin:0 0 10px}
+.stat b{display:block;font-size:24px}.stat span{color:var(--mute);font-size:12px}
+button,select,input{font:inherit;color:inherit;background:var(--card);border:1px solid var(--line);border-radius:6px;padding:6px 10px}
+button{cursor:pointer}button:hover{border-color:var(--acc)}button.p{background:var(--acc);color:#fff;border-color:var(--acc)}
+button.d{color:var(--bad)}button.w{color:var(--warn)}button:disabled{opacity:.5;cursor:wait}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+h2{font-size:15px;margin:26px 0 10px}
+table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+th{font-size:12px;color:var(--mute);font-weight:600}.wrap{overflow-x:auto;background:var(--card);border:1px solid var(--line);border-radius:10px}
+.badge{font-size:11px;font-weight:600;padding:2px 8px;border-radius:99px;border:1px solid currentColor}
+.RUNNING{color:var(--acc)}.COMPLETED{color:var(--ok)}.FAILED{color:var(--bad)}.PAUSED{color:var(--warn)}.PENDING,.CANCELLED{color:var(--mute)}
+.mono{font-family:ui-monospace,monospace;font-size:12px}.err{color:var(--bad);font-size:12px;max-width:260px;word-break:break-word}
+.msg{font-size:12px;color:var(--mute);min-height:18px;margin-top:8px}
+#login{position:fixed;inset:0;background:var(--bg);display:flex;align-items:center;justify-content:center;z-index:9}
+#login form{width:300px}#login input{width:100%;margin:10px 0}
+dialog{width:min(900px,94vw);max-height:85vh;border:1px solid var(--line);border-radius:10px;background:var(--card);color:var(--text)}
+dialog::backdrop{background:#0008}pre{overflow:auto;max-height:50vh;background:var(--bg);padding:10px;border-radius:6px;font-size:12px}
+.hide{display:none!important}
+</style></head><body>
+<div id="login"><form class="card" id="loginForm"><h3>Glynac Ingestion Console</h3><p class="sub">Enter the console password (UI_PASSWORD).</p>
+<input id="pw" type="password" placeholder="Password" autocomplete="current-password" autofocus><button class="p" style="width:100%">Sign in</button><div class="msg" id="loginMsg"></div></form></div>
 
-  /* System Metrics Ribbon */
-  .stats-ribbon {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-    gap: 12px;
-    padding: 16px 24px;
-    background: var(--surface);
-    border-bottom: 1px solid var(--border);
-  }
-  .stat-card {
-    background: var(--surface-raised);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    padding: 10px 14px;
-  }
-  .stat-label { font-size: 11px; text-transform: uppercase; color: var(--text-muted); letter-spacing: 0.05em; font-weight: 500; }
-  .stat-val { font-size: 20px; font-weight: 600; color: var(--text-bright); margin-top: 4px; font-family: 'IBM Plex Mono', monospace; }
-  
-  /* Tabs Navigation */
-  .tabs-nav {
-    display: flex;
-    gap: 4px;
-    padding: 0 24px;
-    border-bottom: 1px solid var(--border);
-    background: var(--surface);
-  }
-  .tab-btn {
-    padding: 12px 18px;
-    background: transparent;
-    border: none;
-    border-bottom: 2px solid transparent;
-    color: var(--text-muted);
-    font-weight: 500;
-    font-size: 13px;
-    cursor: pointer;
-    transition: all 0.2s;
-  }
-  .tab-btn:hover { color: var(--text); }
-  .tab-btn.active {
-    color: var(--text-bright);
-    border-bottom-color: var(--accent);
-  }
-
-  /* Main Container */
-  main {
-    max-width: 1300px;
-    margin: 0 auto;
-    padding: 24px;
-  }
-  .tab-pane { display: none; }
-  .tab-pane.active { display: block; }
-
-  /* Panels */
-  .grid-layout {
-    display: grid;
-    grid-template-columns: 320px 1fr;
-    gap: 20px;
-  }
-  @media (max-width: 900px) {
-    .grid-layout { grid-template-columns: 1fr; }
-  }
-  section {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 18px;
-    margin-bottom: 20px;
-  }
-  section h2 {
-    font-size: 12px;
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    color: var(--text-muted);
-    margin: 0 0 14px 0;
-    font-weight: 600;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-  }
-  
-  /* Buttons */
-  button {
-    background: var(--accent);
-    color: #0d1117;
-    border: none;
-    border-radius: 6px;
-    padding: 8px 14px;
-    font-weight: 600;
-    font-size: 12.5px;
-    cursor: pointer;
-    transition: background 0.15s;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    gap: 6px;
-  }
-  button:hover { background: var(--accent-hover); }
-  button.ghost {
-    background: transparent;
-    border: 1px solid var(--border);
-    color: var(--text);
-    font-weight: 500;
-    padding: 4px 8px;
-    font-size: 11.5px;
-  }
-  button.ghost:hover { border-color: var(--accent); color: var(--accent); }
-  button.danger { color: var(--danger); }
-  button.danger:hover { border-color: var(--danger); color: var(--danger); background: rgba(248,81,73,0.1); }
-  button.warning { color: var(--warning); }
-  button.warning:hover { border-color: var(--warning); color: var(--warning); background: rgba(210,153,34,0.1); }
-  button.secondary { background: var(--surface-raised); color: var(--text); border: 1px solid var(--border); width: 100%; margin-top: 8px; }
-  button.secondary:hover { border-color: var(--border-hover); background: #28303a; }
-  
-  /* Tables */
-  table { width: 100%; border-collapse: collapse; }
-  th {
-    text-align: left;
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    color: var(--text-muted);
-    font-weight: 600;
-    padding: 10px 8px;
-    border-bottom: 1px solid var(--border);
-  }
-  td {
-    padding: 10px 8px;
-    border-bottom: 1px solid var(--border);
-    font-size: 12.5px;
-    vertical-align: middle;
-  }
-  tr:hover td { background: rgba(255,255,255,0.015); }
-  
-  /* Status Badges */
-  .badge {
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-    padding: 3px 8px;
-    border-radius: 12px;
-    font-size: 11px;
-    font-weight: 600;
-    font-family: 'IBM Plex Mono', monospace;
-  }
-  .badge::before {
-    content: "";
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    background: currentColor;
-  }
-  .badge.PENDING      { color: var(--text-muted); background: rgba(139,148,158,0.15); }
-  .badge.RUNNING      { color: var(--cyan);       background: rgba(57,197,207,0.15); }
-  .badge.InProgress   { color: var(--cyan);       background: rgba(57,197,207,0.15); }
-  .badge.PAUSED       { color: var(--warning);    background: rgba(210,153,34,0.15); }
-  .badge.COMPLETED    { color: var(--success);    background: rgba(63,185,80,0.15); }
-  .badge.JobComplete  { color: var(--success);    background: rgba(63,185,80,0.15); }
-  .badge.FAILED       { color: var(--danger);     background: rgba(248,81,73,0.15); }
-  .badge.CANCELLED    { color: var(--text-muted); background: rgba(139,148,158,0.15); }
-
-  .actions-cell { display: flex; gap: 5px; align-items: center; flex-wrap: wrap; }
-  .empty { color: var(--text-muted); font-size: 13px; padding: 24px; text-align: center; }
-  .status-line { color: var(--text-muted); font-size: 12px; margin-top: 10px; min-height: 18px; }
-
-  /* Files list */
-  .files-list { max-height: 380px; overflow-y: auto; }
-  .file-item {
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 12px;
-    color: var(--text);
-    padding: 8px 10px;
-    border-bottom: 1px solid var(--border);
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-  }
-  .file-item:hover { background: var(--surface-raised); }
-
-  /* Modal */
-  .modal-overlay {
-    display: none;
-    position: fixed;
-    top: 0; left: 0; right: 0; bottom: 0;
-    background: rgba(0,0,0,0.7);
-    z-index: 100;
-    align-items: center;
-    justify-content: center;
-    padding: 20px;
-  }
-  .modal-overlay.active { display: flex; }
-  .modal-card {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    width: 100%;
-    max-width: 900px;
-    max-height: 85vh;
-    display: flex;
-    flex-direction: column;
-    overflow: hidden;
-    box-shadow: 0 12px 36px rgba(0,0,0,0.6);
-  }
-  .modal-header {
-    padding: 14px 20px;
-    border-bottom: 1px solid var(--border);
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    background: var(--surface-raised);
-  }
-  .modal-header h3 { margin: 0; font-size: 14px; font-weight: 600; color: var(--text-bright); }
-  .modal-close {
-    background: transparent;
-    border: none;
-    color: var(--text-muted);
-    font-size: 18px;
-    cursor: pointer;
-    padding: 0 4px;
-  }
-  .modal-close:hover { color: var(--text-bright); }
-  .modal-body {
-    padding: 20px;
-    overflow-y: auto;
-    font-size: 12.5px;
-  }
-  .code-block {
-    background: #090d13;
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    padding: 12px;
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 12px;
-    white-space: pre-wrap;
-    color: #79c0ff;
-    max-height: 280px;
-    overflow-y: auto;
-  }
-</style>
-</head>
-<body>
-
-<header>
-  <div class="brand">
-    <div class="brand-logo">G</div>
-    <h1>GLYNAC INGESTION PLATFORM &middot; CONSOLE</h1>
-  </div>
-  <div class="creds">
-    <span class="mono" style="font-size:11px; color:var(--text-muted);">HMAC Key:</span>
-    <input id="secret" type="password" value="OR!ON" placeholder="HMAC Secret" size="14" />
-    <span class="mono" style="font-size:11px; color:var(--text-muted);">Tenant:</span>
-    <input id="orgId" type="text" value="org1" placeholder="org" size="6" />
-  </div>
-</header>
-
-<!-- Metrics Ribbon -->
-<div class="stats-ribbon">
-  <div class="stat-card">
-    <div class="stat-label">Total Jobs</div>
-    <div class="stat-val" id="statTotalJobs">0</div>
-  </div>
-  <div class="stat-card">
-    <div class="stat-label">Total Landed Rows</div>
-    <div class="stat-val" id="statTotalRows" style="color:var(--success);">0</div>
-  </div>
-  <div class="stat-card">
-    <div class="stat-label">Active Workers</div>
-    <div class="stat-val" id="statRunning" style="color:var(--cyan);">0</div>
-  </div>
-  <div class="stat-card">
-    <div class="stat-label">Storage Backend</div>
-    <div class="stat-val" id="statStorage" style="font-size:14px; margin-top:8px;">MinIO / Local</div>
-  </div>
-  <div class="stat-card">
-    <div class="stat-label">ClickHouse Engine</div>
-    <div class="stat-val" id="statClickhouse" style="font-size:14px; margin-top:8px; color:var(--purple);">Online</div>
-  </div>
-</div>
-
-<!-- Tabs -->
-<div class="tabs-nav">
-  <button class="tab-btn active" onclick="switchTab('salesforce')">Task 1: Salesforce Bulk API</button>
-  <button class="tab-btn" onclick="switchTab('hubspot')">Task 2: HubSpot dlt Pipeline</button>
-  <button class="tab-btn" onclick="switchTab('slack')">Task 3: Slack Dual-Mode</button>
-  <button class="tab-btn" onclick="switchTab('views')">ClickHouse Analytical Views</button>
-  <button class="tab-btn" onclick="switchTab('storage')">MinIO Storage Browser</button>
-</div>
-
+<header><h1>Glynac Ingestion Console</h1><span class="chip" id="chipStore">storage…</span><span class="chip" id="chipCH">clickhouse…</span>
+<label class="row">Org <input id="org" value="org1" size="8"></label><button id="logout">Sign out</button></header>
 <main>
-  <!-- TAB 1: SALESFORCE -->
-  <div class="tab-pane active" id="pane-salesforce">
-    <div class="grid-layout">
-      <section>
-        <h2>Trigger Salesforce Sync</h2>
-        <label style="font-size:11px; color:var(--text-muted); display:block; margin-bottom:5px;">SELECT OBJECT (10+ AVAILABLE)</label>
-        <select id="sfObjectSelect" style="width:100%; margin-bottom:12px;"><option>Loading objects...</option></select>
-        <button id="sfRunBtn" style="width:100%;" onclick="triggerSalesforceSync()">Trigger Bulk Sync</button>
-        <div class="status-line" id="sfTriggerStatus"></div>
-      </section>
+<div class="grid g4" id="stats"></div>
 
-      <section>
-        <h2>Salesforce Bulk v2 Ingestion Jobs</h2>
-        <table>
-          <thead>
-            <tr><th>Object / ID</th><th>Status</th><th>Rows</th><th>Duration</th><th>Retries</th><th>Actions</th></tr>
-          </thead>
-          <tbody id="sfJobsBody"></tbody>
-        </table>
-        <div class="empty" id="sfJobsEmpty">No Salesforce bulk jobs yet.</div>
-      </section>
-    </div>
-  </div>
-
-  <!-- TAB 2: HUBSPOT -->
-  <div class="tab-pane" id="pane-hubspot">
-    <div class="grid-layout">
-      <section>
-        <h2>HubSpot Ingestion Controls</h2>
-        <label style="font-size:11px; color:var(--text-muted); display:block; margin-bottom:5px;">RESOURCE</label>
-        <select id="hsObjectSelect" style="width:100%; margin-bottom:12px;"><option>Loading resources...</option></select>
-        <button style="width:100%; margin-bottom:8px;" onclick="triggerHubspotSync()">Trigger Resource Ingest</button>
-        <button class="secondary" onclick="triggerHubspotStartAll()">⚡ Trigger All 8 in Parallel</button>
-        <div class="status-line" id="hsTriggerStatus"></div>
-      </section>
-
-      <section>
-        <h2>HubSpot `dlt` Pipeline Jobs (Parquet)</h2>
-        <table>
-          <thead>
-            <tr><th>Resource / ID</th><th>Status</th><th>Rows</th><th>Duration</th><th>Retries</th><th>Actions</th></tr>
-          </thead>
-          <tbody id="hsJobsBody"></tbody>
-        </table>
-        <div class="empty" id="hsJobsEmpty">No HubSpot jobs yet.</div>
-      </section>
-    </div>
-  </div>
-
-  <!-- TAB 3: SLACK -->
-  <div class="tab-pane" id="pane-slack">
-    <div class="grid-layout">
-      <section>
-        <h2>Slack Ingestion Controls</h2>
-        <button style="width:100%; margin-bottom:8px;" onclick="triggerSlackHistorical()">▶ Start Historical Backfill</button>
-        <button class="secondary" style="margin-bottom:8px;" onclick="triggerSlackRealtime()">⚡ Start Realtime Stream Worker</button>
-        <button class="ghost" style="width:100%; margin-top:8px; text-align:center;" onclick="sendSlackEvent()">✉ Send Simulated Event (Idempotent)</button>
-        <div class="status-line" id="slackTriggerStatus"></div>
-      </section>
-
-      <section>
-        <h2>Slack Dual-Mode Jobs</h2>
-        <table>
-          <thead>
-            <tr><th>Mode / ID</th><th>Status</th><th>Messages</th><th>Duration</th><th>Retries</th><th>Actions</th></tr>
-          </thead>
-          <tbody id="slackJobsBody"></tbody>
-        </table>
-        <div class="empty" id="slackJobsEmpty">No Slack jobs yet.</div>
-      </section>
-    </div>
-  </div>
-
-  <!-- TAB 4: CLICKHOUSE VIEWS -->
-  <div class="tab-pane" id="pane-views">
-    <section>
-      <h2>Curated Analytical Views & Live ClickHouse Tables</h2>
-      <p style="color:var(--text-muted); font-size:12px; margin-top:-6px; margin-bottom:16px;">
-        Curated ClickHouse analytical views automatically join extracted bronze data across platforms for real-time reporting.
-      </p>
-      <table>
-        <thead>
-          <tr><th>View / Table</th><th>Scope</th><th>Description</th><th>Action</th></tr>
-        </thead>
-        <tbody id="viewsTableBody"></tbody>
-      </table>
-    </section>
-  </div>
-
-  <!-- TAB 5: MINIO STORAGE -->
-  <div class="tab-pane" id="pane-storage">
-    <section>
-      <h2>
-        <span>MinIO Object Storage Browser</span>
-        <div>
-          <button class="ghost" onclick="refreshStorage('all')">All</button>
-          <button class="ghost" onclick="refreshStorage('salesforce')">Salesforce</button>
-          <button class="ghost" onclick="refreshStorage('hubspot')">HubSpot</button>
-          <button class="ghost" onclick="refreshStorage('slack')">Slack</button>
-        </div>
-      </h2>
-      <div class="files-list" id="storageFilesList"><div class="empty">No files loaded.</div></div>
-    </section>
-  </div>
-</main>
-
-<!-- Universal Modal Dialog -->
-<div class="modal-overlay" id="appModal">
-  <div class="modal-card">
-    <div class="modal-header">
-      <h3 id="modalTitle">Modal Title</h3>
-      <button class="modal-close" onclick="closeModal()">&times;</button>
-    </div>
-    <div class="modal-body" id="modalBody">
-      <!-- Dynamic Content -->
-    </div>
-  </div>
+<h2>Start ingestion</h2>
+<div class="grid g3">
+ <div class="card"><h3>Salesforce Bulk API v2</h3><p class="sub">Pick an object, or run all 10.</p>
+  <div class="row"><select id="sfObj"></select><button class="p" data-act="sf-start">Sync</button><button data-act="sf-all">Sync all</button></div><div class="msg" id="sfMsg"></div></div>
+ <div class="card"><h3>HubSpot dlt pipeline</h3><p class="sub">Parquet to MinIO, parallel workers.</p>
+  <div class="row"><select id="hsObj"></select><button class="p" data-act="hs-start">Start</button><button data-act="hs-all">Start all 8</button></div><div class="msg" id="hsMsg"></div></div>
+ <div class="card"><h3>Slack dual-mode</h3><p class="sub">Historical backfill or live stream.</p>
+  <div class="row"><button class="p" data-act="sl-hist">Backfill</button><button data-act="sl-live">Start realtime</button><button data-act="sl-event">Send test event</button></div><div class="msg" id="slMsg"></div></div>
 </div>
+
+<h2>Jobs</h2>
+<div class="row" style="margin-bottom:8px"><select id="filter"><option value="">All services</option><option>salesforce</option><option>hubspot</option><option>slack</option></select><button data-act="refresh">Refresh</button><span class="chip" id="updated"></span></div>
+<div class="wrap"><table><thead><tr><th>Service / object</th><th>Status</th><th>Rows</th><th>Time</th><th>Retries</th><th>Error</th><th>Actions</th></tr></thead><tbody id="jobs"></tbody></table></div>
+
+<h2>ClickHouse analytical views</h2><div class="grid g3" id="views"></div>
+<h2>Landed files (MinIO)</h2><div class="card"><div class="row"><select id="fsvc"><option>salesforce</option><option>hubspot</option><option>slack</option></select><button data-act="files">Load files</button></div><pre id="files">Choose a service and load.</pre></div>
+</main>
+<dialog id="dlg"><div class="row" style="justify-content:space-between"><h3 id="dlgTitle" style="margin:0"></h3><button data-act="close">Close</button></div><div id="dlgBody"></div></dialog>
 
 <script>
-const $ = (id) => document.getElementById(id);
-
-// --- Crypto & HMAC Signing ---
-async function hmacSign(secret, message) {
-  const enc = new TextEncoder();
-  const key = await crypto.subtle.importKey(
-    "raw", enc.encode(secret || "OR!ON"), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]
-  );
-  const sig = await crypto.subtle.sign("HMAC", key, enc.encode(message));
-  return Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, "0")).join("");
+const $=id=>document.getElementById(id);
+const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+async function api(path,opt={}){
+  const r=await fetch(path,{credentials:"same-origin",headers:{"Content-Type":"application/json"},...opt});
+  if(r.status===401){showLogin();throw new Error("Session expired - sign in again")}
+  if(!r.ok){let d="";try{d=(await r.json()).detail}catch{}throw new Error(typeof d==="string"&&d?d:"HTTP "+r.status)}
+  return r.json();
 }
-
-async function signedFetch(path, options = {}) {
-  const secret = $("secret").value || "OR!ON";
-  const body = options.body || "";
-  const ts = Math.floor(Date.now() / 1000).toString();
-  const sig = await hmacSign(secret, ts + body);
-  const headers = Object.assign(
-    { "Content-Type": "application/json" },
-    options.headers || {},
-    { "X-Timestamp": ts, "X-Signature": sig }
-  );
-  return fetch(path, Object.assign({}, options, { headers }));
+const post=(p,b)=>api(p,{method:"POST",body:JSON.stringify(b||{})});
+let timer=null;
+function showLogin(){$("login").classList.remove("hide");clearInterval(timer);timer=null}
+async function start(){
+  $("login").classList.add("hide");
+  const [sf,hs]=await Promise.all([api("/api/salesforce/objects"),api("/api/hubspot/objects")]);
+  $("sfObj").innerHTML=sf.objects.map(o=>`<option>${esc(o)}</option>`).join("");
+  $("hsObj").innerHTML=hs.objects.map(o=>`<option>${esc(o)}</option>`).join("");
+  loadViews();refresh();clearInterval(timer);timer=setInterval(refresh,3000);
 }
+$("loginForm").onsubmit=async e=>{e.preventDefault();$("loginMsg").textContent="";
+  try{await post("/api/auth/login",{password:$("pw").value});$("pw").value="";await start()}catch(x){$("loginMsg").textContent=x.message}};
+$("logout").onclick=async()=>{await fetch("/api/auth/logout",{method:"POST"});showLogin()};
 
-function badge(status) {
-  const label = status === "RUNNING" ? "InProgress" : status === "COMPLETED" ? "JobComplete" : status;
-  return `<span class="badge ${status}">${label}</span>`;
+const dur=s=>s<60?Math.round(s)+"s":Math.floor(s/60)+"m "+Math.round(s%60)+"s";
+async function refresh(){
+  try{
+    const [jobs,st,sys]=await Promise.all([api("/api/jobs"),api("/api/jobs/stats"),api("/api/analytics/status")]);
+    const by=st.by_status||{};
+    $("stats").innerHTML=[["Jobs",st.total_jobs],["Rows extracted",st.total_rows_extracted],["Running",by.RUNNING||0],["Failed",by.FAILED||0]]
+      .map(([l,v])=>`<div class="card stat"><b>${esc(v)}</b><span>${l}</span></div>`).join("");
+    $("chipStore").textContent="storage: "+sys.storage_type;$("chipCH").textContent="clickhouse: "+sys.clickhouse_mode;
+    const f=$("filter").value,list=jobs.filter(j=>!f||j.service===f);
+    $("jobs").innerHTML=list.length?list.map(row).join(""):`<tr><td colspan="7" class="sub">No jobs yet. Start one above.</td></tr>`;
+    $("updated").textContent="updated "+new Date().toLocaleTimeString();
+  }catch(e){$("updated").textContent=e.message}
 }
-
-function formatDuration(sec) {
-  if (sec === undefined || sec === null) return "-";
-  if (sec < 60) return `${sec}s`;
-  const m = Math.floor(sec / 60);
-  const s = Math.round(sec % 60);
-  return `${m}m ${s}s`;
+function row(j){
+  const b=[];
+  if(j.status==="RUNNING")b.push(["pause","Pause","w"]);
+  if(j.status==="PAUSED"||j.status==="FAILED")b.push(["resume","Resume",""]);
+  if(!["COMPLETED","CANCELLED"].includes(j.status))b.push(["cancel","Cancel","d"]);
+  const btn=b.map(([a,l,c])=>`<button class="${c}" data-job="${esc(j.id)}" data-svc="${esc(j.service)}" data-act="job-${a}">${l}</button>`).join(" ");
+  return `<tr><td><b>${esc(j.service)}</b><br><span class="mono">${esc(j.object_name)} · ${esc(j.org_id)}</span></td>
+  <td><span class="badge ${esc(j.status)}">${esc(j.status)}</span></td><td>${esc(j.row_count)}</td><td>${dur(j.duration_seconds||0)}</td><td>${esc(j.retry_count)}</td>
+  <td class="err">${esc(j.error||"")}</td><td><div class="row">${btn}
+  <button data-act="inspect" data-svc="${esc(j.service)}" data-obj="${esc(j.object_name)}">Table</button>
+  <button data-act="logs" data-job="${esc(j.id)}">Logs</button></div></td></tr>`;
 }
-
-// --- Tabs Navigation ---
-function switchTab(tab) {
-  document.querySelectorAll(".tab-pane").forEach(el => el.classList.remove("active"));
-  document.querySelectorAll(".tab-btn").forEach(el => el.classList.remove("active"));
-  $(`pane-${tab}`).classList.add("active");
-  event.target.classList.add("active");
-  if (tab === "storage") refreshStorage();
-  if (tab === "views") loadAnalyticalViews();
+async function loadViews(){
+  try{const v=await api("/api/analytics/views");
+  $("views").innerHTML=v.views.map(x=>`<div class="card"><h3 class="mono">${esc(x.name)}</h3><p class="sub">${esc(x.task)}</p><p>${esc(x.description)}</p><button data-act="view" data-name="${esc(x.name)}">Inspect</button></div>`).join("")}catch{}
 }
-
-// --- Object Selectors ---
-async function loadObjects() {
-  try {
-    const [sfRes, hsRes] = await Promise.all([
-      signedFetch("/api/salesforce/objects"),
-      signedFetch("/api/hubspot/objects")
-    ]);
-    if (sfRes.ok) {
-      const sf = await sfRes.json();
-      $("sfObjectSelect").innerHTML = sf.objects.map(o => `<option value="${o}">${o}</option>`).join("");
-    }
-    if (hsRes.ok) {
-      const hs = await hsRes.json();
-      $("hsObjectSelect").innerHTML = hs.objects.map(o => `<option value="${o}">${o}</option>`).join("");
-    }
-  } catch(e) {
-    console.warn("Failed to load objects", e);
-  }
+function modal(t,html){$("dlgTitle").textContent=t;$("dlgBody").innerHTML=html;$("dlg").showModal()}
+function tableHtml(d){
+  if(!d.exists)return `<p>Table <span class="mono">${esc(d.table_name)}</span> does not exist yet (${esc(d.mode)}). Run an ingestion first.${d.error?`<br><span class="err">${esc(d.error)}</span>`:""}</p>`;
+  const cols=(d.columns||[]).map(c=>c.name);
+  return `<p><span class="mono">${esc(d.table_name)}</span> · ${esc(d.row_count)} rows · ${esc(d.mode)}</p><div class="wrap"><table><thead><tr>${cols.map(c=>`<th>${esc(c)}</th>`).join("")}</tr></thead><tbody>${(d.sample||[]).map(r=>`<tr>${cols.map(c=>`<td class="mono">${esc(r[c])}</td>`).join("")}</tr>`).join("")}</tbody></table></div>`;
 }
-
-// --- Actions: Salesforce ---
-async function triggerSalesforceSync() {
-  const obj = $("sfObjectSelect").value;
-  const orgId = $("orgId").value || "org1";
-  const btn = $("sfRunBtn");
-  if (btn) btn.disabled = true;
-  $("sfTriggerStatus").textContent = `Triggering ${obj}...`;
-  try {
-    const res = await signedFetch("/api/salesforce/start", {
-      method: "POST",
-      body: JSON.stringify({ object_name: obj, org_id: orgId })
-    });
-    if (res.ok) {
-      const job = await res.json();
-      $("sfTriggerStatus").textContent = `Sync started for ${obj} (ID: ${job.id.slice(0, 8)})!`;
-      await refreshAll();
-    } else {
-      const err = await res.json().catch(() => ({}));
-      $("sfTriggerStatus").textContent = `Error: ${err.detail || res.status}`;
-    }
-  } catch(e) {
-    $("sfTriggerStatus").textContent = `Network error: ${e.message}`;
-  } finally {
-    if (btn) btn.disabled = false;
-  }
-}
-
-// --- Actions: HubSpot ---
-async function triggerHubspotSync() {
-  const obj = $("hsObjectSelect").value;
-  const orgId = $("orgId").value || "org1";
-  $("hsTriggerStatus").textContent = `Starting ${obj}...`;
-  try {
-    const res = await signedFetch("/api/hubspot/start", {
-      method: "POST",
-      body: JSON.stringify({ object_name: obj, org_id: orgId })
-    });
-    if (res.ok) {
-      const job = await res.json();
-      $("hsTriggerStatus").textContent = `Started ${obj} (ID: ${job.id.slice(0, 8)})!`;
-      await refreshAll();
-    } else {
-      const err = await res.json().catch(() => ({}));
-      $("hsTriggerStatus").textContent = `Error: ${err.detail || res.status}`;
-    }
-  } catch(e) {
-    $("hsTriggerStatus").textContent = `Network error: ${e.message}`;
-  }
-}
-
-async function triggerHubspotStartAll() {
-  const orgId = $("orgId").value || "org1";
-  $("hsTriggerStatus").textContent = "Launching all 8 parallel workers...";
-  try {
-    const res = await signedFetch("/api/hubspot/start_all", {
-      method: "POST",
-      body: JSON.stringify({ org_id: orgId })
-    });
-    if (res.ok) {
-      $("hsTriggerStatus").textContent = "All 8 parallel workers running!";
-      await refreshAll();
-    } else {
-      const err = await res.json().catch(() => ({}));
-      $("hsTriggerStatus").textContent = `Error: ${err.detail || res.status}`;
-    }
-  } catch(e) {
-    $("hsTriggerStatus").textContent = `Network error: ${e.message}`;
-  }
-}
-
-// --- Actions: Slack ---
-async function triggerSlackHistorical() {
-  const orgId = $("orgId").value || "org1";
-  $("slackTriggerStatus").textContent = "Starting historical backfill...";
-  try {
-    const res = await signedFetch("/api/slack/historical/start", {
-      method: "POST",
-      body: JSON.stringify({ org_id: orgId, page_size: 10, total_messages: 50 })
-    });
-    if (res.ok) {
-      const job = await res.json();
-      $("slackTriggerStatus").textContent = `Historical backfill started (ID: ${job.id.slice(0, 8)})!`;
-      await refreshAll();
-    } else {
-      const err = await res.json().catch(() => ({}));
-      $("slackTriggerStatus").textContent = `Error: ${err.detail || res.status}`;
-    }
-  } catch(e) {
-    $("slackTriggerStatus").textContent = `Network error: ${e.message}`;
-  }
-}
-
-async function triggerSlackRealtime() {
-  const orgId = $("orgId").value || "org1";
-  $("slackTriggerStatus").textContent = "Starting realtime event worker...";
-  try {
-    const res = await signedFetch("/api/slack/realtime/start", {
-      method: "POST",
-      body: JSON.stringify({ org_id: orgId })
-    });
-    if (res.ok) {
-      const job = await res.json();
-      $("slackTriggerStatus").textContent = `Realtime stream worker active (ID: ${job.id.slice(0, 8)})!`;
-      await refreshAll();
-    } else {
-      const err = await res.json().catch(() => ({}));
-      $("slackTriggerStatus").textContent = `Error: ${err.detail || res.status}`;
-    }
-  } catch(e) {
-    $("slackTriggerStatus").textContent = `Network error: ${e.message}`;
-  }
-}
-
-async function sendSlackEvent() {
-  const res = await signedFetch("/api/slack/realtime/event", {
-    method: "POST",
-    body: JSON.stringify({
-      channel_id: "C001",
-      user_id: "U001",
-      text: "Real-time compliance message: Trade order execution #9821 approved.",
-      message_ts: (Date.now() / 1000).toFixed(6),
-      event_id: `evt-${Date.now()}`
-    })
-  });
-  if (res.ok) {
-    $("slackTriggerStatus").textContent = "Live event ingested idempotently!";
-    refreshAll();
-  } else {
-    const err = await res.json().catch(() => ({}));
-    $("slackTriggerStatus").textContent = `Error: ${err.detail || res.status}`;
-  }
-}
-
-// --- Job Control Actions ---
-async function jobAction(service, action, jobId) {
-  const method = action === "remove" ? "DELETE" : "POST";
-  const path = `/api/${service}/${action}/${jobId}`;
-  await signedFetch(path, { method });
-  refreshAll();
-}
-
-function renderActionButtons(service, job) {
-  const buttons = [];
-  if (job.status === "RUNNING") {
-    buttons.push(`<button class="ghost warning" onclick="jobAction('${service}','pause','${job.id}')">Pause</button>`);
-  }
-  if (job.status === "PAUSED" || job.status === "FAILED") {
-    buttons.push(`<button class="ghost" onclick="jobAction('${service}','resume','${job.id}')">Resume</button>`);
-  }
-  if (job.status !== "COMPLETED" && job.status !== "CANCELLED") {
-    buttons.push(`<button class="ghost danger" onclick="jobAction('${service}','cancel','${job.id}')">Cancel</button>`);
-  }
-  // Inspect ClickHouse Table action button
-  buttons.push(`<button class="ghost" onclick="inspectClickHouse('${service}','${job.object_name}')">Inspect CH</button>`);
-  // View Audit / Error Logs
-  buttons.push(`<button class="ghost" onclick="viewAuditLogs('${job.id}')">Logs</button>`);
-  return `<div class="actions-cell">${buttons.join("")}</div>`;
-}
-
-// --- ClickHouse Table & Views Inspection Modal ---
-async function inspectClickHouse(service, objectName) {
-  const res = await signedFetch(`/api/${service}/clickhouse/${objectName}`);
-  if (!res.ok) {
-    alert("Could not inspect ClickHouse table");
-    return;
-  }
-  const data = await res.json();
-  $("modalTitle").textContent = `ClickHouse Table Inspector — ${data.table_name || objectName}`;
-  
-  let html = `
-    <div style="display:flex; justify-content:space-between; margin-bottom:14px; background:var(--surface-raised); padding:10px 14px; border-radius:6px;">
-      <div><strong>Status:</strong> ${data.exists ? '<span style="color:var(--success);">Available</span>' : '<span style="color:var(--warning);">Not Created Yet</span>'}</div>
-      <div><strong>Engine Mode:</strong> ${data.mode || 'ClickHouse'}</div>
-      <div><strong>Total Landed Rows:</strong> <span class="mono" style="color:var(--text-bright);">${data.row_count || 0}</span></div>
-    </div>
-  `;
-
-  if (data.columns && data.columns.length) {
-    html += `
-      <h4 style="margin:12px 0 6px 0; color:var(--text-muted); font-size:11px; text-transform:uppercase;">Table Schema (${data.columns.length} Columns)</h4>
-      <div style="max-height:160px; overflow-y:auto; border:1px solid var(--border); border-radius:6px; margin-bottom:16px;">
-        <table>
-          <thead><tr><th>Column Name</th><th>Type</th></tr></thead>
-          <tbody>
-            ${data.columns.map(c => `<tr><td class="mono">${c.name}</td><td class="mono" style="color:var(--cyan);">${c.type}</td></tr>`).join("")}
-          </tbody>
-        </table>
-      </div>
-    `;
-  }
-
-  if (data.sample && data.sample.length) {
-    const keys = Object.keys(data.sample[0]);
-    html += `
-      <h4 style="margin:12px 0 6px 0; color:var(--text-muted); font-size:11px; text-transform:uppercase;">Sample Records (First 10 Rows)</h4>
-      <div style="max-height:260px; overflow-x:auto; border:1px solid var(--border); border-radius:6px;">
-        <table>
-          <thead><tr>${keys.map(k => `<th>${k}</th>`).join("")}</tr></thead>
-          <tbody>
-            ${data.sample.map(row => `<tr>${keys.map(k => `<td class="mono" style="font-size:11.5px;">${row[k] !== null ? row[k] : '<em style="color:var(--text-muted);">null</em>'}</td>`).join("")}</tr>`).join("")}
-          </tbody>
-        </table>
-      </div>
-    `;
-  } else {
-    html += `<div class="empty">No records landed in table yet.</div>`;
-  }
-
-  $("modalBody").innerHTML = html;
-  $("appModal").classList.add("active");
-}
-
-// --- Audit & Error Logs Modal ---
-async function viewAuditLogs(jobId) {
-  const [auditRes, dlRes] = await Promise.all([
-    signedFetch(`/api/jobs/${jobId}/audit`),
-    signedFetch(`/api/jobs/${jobId}/dead_letters`)
-  ]);
-  const audit = auditRes.ok ? await auditRes.json() : [];
-  const deadLetters = dlRes.ok ? await dlRes.json() : [];
-
-  $("modalTitle").textContent = `Job Logs & Audit Trail — ${jobId.slice(0, 8)}`;
-
-  let html = `
-    <h4 style="margin:0 0 8px 0; color:var(--text-muted); font-size:11px; text-transform:uppercase;">Audit Trail History</h4>
-    <div style="max-height:220px; overflow-y:auto; border:1px solid var(--border); border-radius:6px; margin-bottom:16px;">
-      <table>
-        <thead><tr><th>Time</th><th>Event</th><th>Detail</th></tr></thead>
-        <tbody>
-          ${audit.map(a => `
-            <tr>
-              <td class="mono" style="color:var(--text-muted);">${new Date(a.created_at).toLocaleTimeString()}</td>
-              <td class="mono"><strong>${a.event}</strong></td>
-              <td style="color:var(--text);">${a.detail || "-"}</td>
-            </tr>
-          `).join("")}
-        </tbody>
-      </table>
-    </div>
-  `;
-
-  if (deadLetters.length) {
-    html += `
-      <h4 style="margin:12px 0 8px 0; color:var(--danger); font-size:11px; text-transform:uppercase;">Dead-Letter Discarded Records (${deadLetters.length})</h4>
-      <div style="max-height:200px; overflow-y:auto; border:1px solid var(--border); border-radius:6px;">
-        <table>
-          <thead><tr><th>Reason</th><th>Raw Record</th></tr></thead>
-          <tbody>
-            ${deadLetters.map(dl => `
-              <tr>
-                <td style="color:var(--danger);">${dl.reason}</td>
-                <td class="mono" style="font-size:11px;">${dl.record}</td>
-              </tr>
-            `).join("")}
-          </tbody>
-        </table>
-      </div>
-    `;
-  }
-
-  $("modalBody").innerHTML = html;
-  $("appModal").classList.add("active");
-}
-
-function closeModal() {
-  $("appModal").classList.remove("active");
-}
-
-// --- Analytical Views Catalog ---
-async function loadAnalyticalViews() {
-  const res = await signedFetch("/api/analytics/views");
-  if (!res.ok) return;
-  const data = await res.json();
-  const body = $("viewsTableBody");
-  body.innerHTML = data.views.map(v => `
-    <tr>
-      <td><strong>${v.name}</strong></td>
-      <td><span class="badge PENDING">${v.task}</span></td>
-      <td>${v.description}</td>
-      <td>
-        <button class="ghost" onclick="inspectView('${v.name}')">Inspect View</button>
-      </td>
-    </tr>
-  `).join("");
-}
-
-async function inspectView(viewName) {
-  const res = await signedFetch(`/api/analytics/inspect/${viewName}`);
-  if (!res.ok) return;
-  const data = await res.json();
-  $("modalTitle").textContent = `ClickHouse Analytical View — ${viewName}`;
-
-  let html = `
-    <div style="display:flex; justify-content:space-between; margin-bottom:14px; background:var(--surface-raised); padding:10px 14px; border-radius:6px;">
-      <div><strong>View:</strong> ${viewName}</div>
-      <div><strong>Total Rows Joined:</strong> <span class="mono" style="color:var(--success); font-weight:600;">${data.row_count || 0}</span></div>
-      <div><strong>Mode:</strong> ${data.mode || 'ClickHouse'}</div>
-    </div>
-  `;
-
-  if (data.sample && data.sample.length) {
-    const keys = Object.keys(data.sample[0]);
-    html += `
-      <div style="max-height:360px; overflow-x:auto; border:1px solid var(--border); border-radius:6px;">
-        <table>
-          <thead><tr>${keys.map(k => `<th>${k}</th>`).join("")}</tr></thead>
-          <tbody>
-            ${data.sample.map(row => `<tr>${keys.map(k => `<td class="mono" style="font-size:11.5px;">${row[k] !== null ? row[k] : '-'}</td>`).join("")}</tr>`).join("")}
-          </tbody>
-        </table>
-      </div>
-    `;
-  } else {
-    html += `<div class="empty">No joined data yet. Ingest Salesforce & HubSpot records to populate this view.</div>`;
-  }
-
-  $("modalBody").innerHTML = html;
-  $("appModal").classList.add("active");
-}
-
-// --- MinIO Storage Browser ---
-async function refreshStorage(filter = "all") {
-  const res = await signedFetch("/api/salesforce/files");
-  const resHs = await signedFetch("/api/hubspot/files");
-  const resSl = await signedFetch("/api/slack/files");
-  
-  let files = [];
-  if (res.ok) files.push(...((await res.json()).files || []));
-  if (resHs.ok) files.push(...((await resHs.json()).files || []));
-  if (resSl.ok) files.push(...((await resSl.json()).files || []));
-
-  if (filter !== "all") {
-    files = files.filter(f => f.startsWith(filter));
-  }
-
-  const list = $("storageFilesList");
-  if (!files.length) {
-    list.innerHTML = `<div class="empty">No landed files found under ${filter}/.</div>`;
-    return;
-  }
-  list.innerHTML = files.map(f => `
-    <div class="file-item">
-      <span>${f}</span>
-      <span class="badge COMPLETED" style="font-size:10px;">Landed</span>
-    </div>
-  `).join("");
-}
-
-// --- Refresh Jobs Lists & Stats ---
-async function refreshAll() {
-  try {
-    const [jobsRes, statsRes, sysRes] = await Promise.all([
-      signedFetch("/api/jobs"),
-      signedFetch("/api/jobs/stats"),
-      signedFetch("/api/analytics/status")
-    ]);
-
-    if (statsRes.ok) {
-      const stats = await statsRes.json();
-      $("statTotalJobs").textContent = stats.total_jobs;
-      $("statTotalRows").textContent = stats.total_rows_extracted.toLocaleString();
-      $("statRunning").textContent = stats.by_status["RUNNING"] || 0;
-    }
-
-    if (sysRes.ok) {
-      const sys = await sysRes.json();
-      $("statStorage").textContent = sys.storage_backend.toUpperCase();
-      $("statClickhouse").textContent = sys.clickhouse_mode;
-    }
-
-    if (jobsRes.ok) {
-      const jobs = await jobsRes.json();
-
-      // Filter by service
-      const sfJobs = jobs.filter(j => j.service === "salesforce");
-      const hsJobs = jobs.filter(j => j.service === "hubspot");
-      const slackJobs = jobs.filter(j => j.service === "slack");
-
-      renderJobsTable("sf", sfJobs, "salesforce");
-      renderJobsTable("hs", hsJobs, "hubspot");
-      renderJobsTable("slack", slackJobs, "slack");
-    }
-  } catch(e) {
-    console.warn("Poll failed", e);
-  }
-}
-
-function renderJobsTable(prefix, jobs, service) {
-  const body = $(`${prefix}JobsBody`);
-  const empty = $(`${prefix}JobsEmpty`);
-  if (!jobs.length) {
-    body.innerHTML = "";
-    empty.style.display = "block";
-    return;
-  }
-  empty.style.display = "none";
-  body.innerHTML = jobs.map(job => `
-    <tr>
-      <td>
-        <strong>${job.object_name || "-"}</strong>
-        <div class="mono" style="color:var(--text-muted); font-size:10.5px;">${job.id.slice(0, 8)}</div>
-      </td>
-      <td>${badge(job.status)}</td>
-      <td class="mono"><strong>${job.row_count.toLocaleString()}</strong></td>
-      <td class="mono" style="color:var(--text-muted);">${formatDuration(job.duration_seconds)}</td>
-      <td class="mono">${job.retry_count}</td>
-      <td>${renderActionButtons(service, job)}</td>
-    </tr>
-  `).join("");
-}
-
-// Initial load
-loadObjects();
-refreshAll();
-loadAnalyticalViews();
-setInterval(refreshAll, 3000);
-</script>
-</body>
-</html>
+const msg=(id,t)=>$(id).textContent=t;
+async function run(id,fn){const el=$(id);el.textContent="Working…";try{el.textContent=await fn();refresh()}catch(e){el.textContent="Error: "+e.message}}
+const ORG=()=>$("org").value||"org1";
+const actions={
+  "sf-start":()=>run("sfMsg",async()=>{const j=await post("/api/salesforce/start",{object_name:$("sfObj").value,org_id:ORG()});return "Started "+j.id.slice(0,8)}),
+  "sf-all":()=>run("sfMsg",async()=>{const os=[...$("sfObj").options].map(o=>o.value);await Promise.all(os.map(o=>post("/api/salesforce/start",{object_name:o,org_id:ORG()})));return "Started "+os.length+" jobs"}),
+  "hs-start":()=>run("hsMsg",async()=>{const j=await post("/api/hubspot/start",{object_name:$("hsObj").value,org_id:ORG()});return "Started "+j.id.slice(0,8)}),
+  "hs-all":()=>run("hsMsg",async()=>{const r=await post("/api/hubspot/start_all",{org_id:ORG()});return r.message}),
+  "sl-hist":()=>run("slMsg",async()=>{const j=await post("/api/slack/historical/start",{org_id:ORG(),page_size:10,total_messages:50});return "Backfill "+j.id.slice(0,8)}),
+  "sl-live":()=>run("slMsg",async()=>{const j=await post("/api/slack/realtime/start",{org_id:ORG()});return "Realtime worker "+j.id.slice(0,8)}),
+  "sl-event":()=>run("slMsg",async()=>{await post("/api/slack/realtime/event",{channel_id:"C001",user_id:"U001",text:"Test compliance message",message_ts:(Date.now()/1000).toFixed(6),event_id:"evt-"+Date.now()});return "Event ingested"}),
+  refresh,close:()=>$("dlg").close(),
+  files:async()=>{const s=$("fsvc").value;try{const r=await api(`/api/${s}/files`);$("files").textContent=r.files.length?r.files.join("\n"):"No files landed yet."}catch(e){$("files").textContent=e.message}},
+};
+document.addEventListener("click",async e=>{
+  const b=e.target.closest("[data-act]");if(!b)return;
+  const a=b.dataset.act,svc=b.dataset.svc;
+  try{
+    if(a.startsWith("job-")){b.disabled=true;await post(`/api/${svc}/${a.slice(4)}/${b.dataset.job}`);refresh();return}
+    if(a==="inspect"){const o=svc==="slack"?b.dataset.obj:b.dataset.obj;const d=await api(`/api/${svc}/clickhouse/${encodeURIComponent(o)}`);modal(svc+" table",tableHtml(d));return}
+    if(a==="view"){modal(b.dataset.name,tableHtml(await api("/api/analytics/inspect/"+encodeURIComponent(b.dataset.name))));return}
+    if(a==="logs"){const [au,dl]=await Promise.all([api(`/api/jobs/${b.dataset.job}/audit`),api(`/api/jobs/${b.dataset.job}/dead_letters`)]);
+      modal("Job logs",`<h3>Audit trail</h3><pre>${esc(au.map(x=>`${x.created_at}  ${x.event}  ${x.detail||""}`).join("\n")||"No events")}</pre><h3>Dead letters (${dl.length})</h3><pre>${esc(dl.map(x=>`${x.reason}: ${x.record}`).join("\n")||"None")}</pre>`);return}
+    if(actions[a])await actions[a]();
+  }catch(x){alert(x.message);refresh()}
+});
+$("filter").onchange=refresh;
+api("/api/auth/me").then(m=>m.authenticated?start():showLogin()).catch(showLogin);
+</script></body></html>

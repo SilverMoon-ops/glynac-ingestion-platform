@@ -34,6 +34,8 @@ def db_session(tmp_path, monkeypatch):
     monkeypatch.setattr("app.salesforce.ingest.SessionLocal", TestingSessionLocal)
     monkeypatch.setattr("app.hubspot.ingest.SessionLocal", TestingSessionLocal)
     monkeypatch.setattr("app.slack.engine.SessionLocal", TestingSessionLocal)
+    monkeypatch.setattr("app.control.SessionLocal", TestingSessionLocal)
+    monkeypatch.setattr("app.recovery.SessionLocal", TestingSessionLocal)
 
     session = TestingSessionLocal()
     yield session

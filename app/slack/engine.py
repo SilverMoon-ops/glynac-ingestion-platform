@@ -12,6 +12,7 @@ import pyarrow.parquet as pq
 from sqlalchemy.orm import Session
 
 from app.audit import send_to_dead_letter
+from app.control import CANCEL, PAUSE, claim_job, clear_control, get_control, set_control
 from app.database import SessionLocal
 from app.jobs import transition, update_checkpoint
 from app.models import Job, JobStatus, ChannelCheckpoint
@@ -33,16 +34,27 @@ def _cancel_event(job_id: str) -> threading.Event:
 
 def request_pause(job_id: str) -> None:
     _pause_event(job_id).set()
+    set_control(job_id, PAUSE)
 
 
 def request_cancel(job_id: str) -> None:
     _cancel_event(job_id).set()
     _pause_event(job_id).set()
+    set_control(job_id, CANCEL)
 
 
 def clear_control_events(job_id: str) -> None:
     _pause_event(job_id).clear()
     _cancel_event(job_id).clear()
+    clear_control(job_id)
+
+
+def _cancel_requested(job_id: str) -> bool:
+    return _cancel_event(job_id).is_set() or get_control(job_id) == CANCEL
+
+
+def _pause_requested(job_id: str) -> bool:
+    return _pause_event(job_id).is_set() or get_control(job_id) in (PAUSE, CANCEL)
 
 
 def _utc_date() -> str:
@@ -323,10 +335,10 @@ def _backfill_channel(
 
     try:
         while True:
-            if _cancel_event(job_id).is_set():
+            if _cancel_requested(job_id):
                 break
 
-            if _pause_event(job_id).is_set():
+            if _pause_requested(job_id):
                 # Save checkpoint for THIS SPECIFIC CHANNEL
                 ckpt = (
                     db.query(ChannelCheckpoint)
@@ -435,6 +447,7 @@ def run_historical_backfill(
 
         if job.status == JobStatus.PENDING.value:
             job = transition(db, job, JobStatus.RUNNING)
+        claim_job(job_id)
 
         channels = mock_channels()
 
@@ -488,9 +501,9 @@ def run_historical_backfill(
         if job is None:
             return
 
-        if _cancel_event(job_id).is_set():
+        if _cancel_requested(job_id):
             transition(db, job, JobStatus.CANCELLED)
-        elif _pause_event(job_id).is_set():
+        elif _pause_requested(job_id):
             if job.status != JobStatus.PAUSED.value:
                 transition(db, job, JobStatus.PAUSED)
         else:

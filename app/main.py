@@ -5,12 +5,15 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
 from app.database import init_db
-from app.routers import system, jobs, salesforce, hubspot, slack, analytics
+from app.recovery import recover_interrupted_jobs
+from app.routers import auth, system, jobs, salesforce, hubspot, slack, analytics
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    if not os.getenv("DISABLE_RECOVERY"):
+        recover_interrupted_jobs()
     yield
 
 
@@ -21,6 +24,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+app.include_router(auth.router)
 app.include_router(system.router)
 app.include_router(jobs.router)
 app.include_router(salesforce.router)
