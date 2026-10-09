@@ -5,19 +5,14 @@ missing entirely last time ("no pagination cursor, no 429/rate-limit
 handling at all"). Deterministic by design: no real randomness in what
 determines control flow, so tests are fast and repeatable.
 """
-from app.errors import TransientError
 import time
 import uuid
 
 from app.hubspot.schemas import generate_fake_page
 
 
-class HubSpotRateLimitError(TransientError):
-    """Stands in for a real HubSpot 429 Too Many Requests + Retry-After response."""
-
-    def __init__(self, retry_after_seconds: int = 2):
-        self.retry_after_seconds = retry_after_seconds
-        super().__init__(f"Simulated 429 Too Many Requests (Retry-After: {retry_after_seconds}s)")
+# Same exception class as the real client, so retry behaviour is identical.
+from app.hubspot.client import HubSpotRateLimitError  # noqa: F401
 
 
 class MockHubSpotClient:

@@ -105,6 +105,8 @@ def mock_services(_mock_server, monkeypatch):
 
     monkeypatch.setattr(settings, "mock_services_url", _mock_server)
     httpx.post(f"{_mock_server}/salesforce/_admin/reset")
+    httpx.post(f"{_mock_server}/hubspot/_admin/reset")
+    httpx.post(f"{_mock_server}/hubspot/_admin/config", json={"latency_seconds": 0})
 
     class Controls:
         url = _mock_server
@@ -112,6 +114,14 @@ def mock_services(_mock_server, monkeypatch):
         @staticmethod
         def salesforce(**config):
             httpx.post(f"{_mock_server}/salesforce/_admin/config", json=config).raise_for_status()
+
+        @staticmethod
+        def hubspot(**config):
+            httpx.post(f"{_mock_server}/hubspot/_admin/config", json=config).raise_for_status()
+
+        @staticmethod
+        def hubspot_requests() -> list[str]:
+            return httpx.get(f"{_mock_server}/hubspot/_admin/requests").json()["requests"]
 
         @staticmethod
         def salesforce_requests() -> list[str]:

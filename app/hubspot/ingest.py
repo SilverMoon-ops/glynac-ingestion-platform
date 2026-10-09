@@ -2,8 +2,11 @@ import json
 from datetime import datetime, timezone
 from typing import Optional
 
-from app.config import settings
-from app.errors import ConfigurationError
+from app.config import mock_base_url, settings
+from app.errors import ConfigurationError, InfrastructureUnavailable
+from app.hubspot.client import HubSpotClient
+from app.retry import with_retry
+from mock_services.hubspot import MOCK_HUBSPOT_TOKEN
 from app.control import claim_job
 from app.database import SessionLocal
 from app.jobs import get_job_or_404, transition, update_checkpoint
@@ -13,6 +16,33 @@ from app.clickhouse_sink import get_clickhouse_sink
 from app.hubspot.mock_server import MockHubSpotClient
 from app.hubspot.pipeline import run_hubspot_sync, clear_pause_signal
 from app.hubspot.schemas import HUBSPOT_SCHEMAS, validate_records
+
+
+@with_retry
+def _authenticate_with_retry(client) -> None:
+    client.authenticate()
+
+
+def _make_client():
+    """
+    HUBSPOT_MOCK_ENABLED=true  -> the real HubSpot client pointed at the mock HTTP server.
+    otherwise                  -> a real API token is REQUIRED; auth failures fail the job.
+    Either way the exact same client code runs; only URL and token differ.
+    """
+    if settings.hubspot_mock_enabled:
+        base = mock_base_url()
+        host, port = base.split("//", 1)[1].split(":")[0], int(base.rsplit(":", 1)[1].split("/")[0])
+        from mock_services.embedded import port_in_use
+
+        if not port_in_use(host, port):
+            raise InfrastructureUnavailable(
+                f"Mock services are not reachable at {base}. Run `python -m mock_services` "
+                f"(or `docker compose up -d`), or set HUBSPOT_MOCK_ENABLED=false with a real HUBSPOT_API_KEY."
+            )
+        return HubSpotClient(f"{base}/hubspot", MOCK_HUBSPOT_TOKEN, page_size=settings.hubspot_mock_page_size)
+    if not settings.hubspot_api_key:
+        raise ConfigurationError("HUBSPOT_MOCK_ENABLED=false but HUBSPOT_API_KEY is not set.")
+    return HubSpotClient(settings.hubspot_base_url, settings.hubspot_api_key, page_size=100)
 
 
 def run_hubspot_ingestion(
@@ -32,16 +62,8 @@ def run_hubspot_ingestion(
     try:
         job = get_job_or_404(db, job_id)
         if client is None:
-            if not settings.hubspot_mock_enabled:
-                raise ConfigurationError(
-                    "HUBSPOT_MOCK_ENABLED=false, but this build has no real HubSpot client yet. "
-                    "Set HUBSPOT_MOCK_ENABLED=true to use the mock."
-                )
-            client = MockHubSpotClient(
-                page_size=settings.hubspot_mock_page_size,
-                total_records=settings.hubspot_mock_total_records,
-                latency_seconds=settings.hubspot_mock_latency_seconds,
-            )
+            client = _make_client()
+            _authenticate_with_retry(client)
         # The /resume endpoint already flips the job to RUNNING before this worker
         # starts, so only transition if that hasn't happened yet.
         if job.status != JobStatus.RUNNING.value:
