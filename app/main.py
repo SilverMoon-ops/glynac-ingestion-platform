@@ -11,9 +11,27 @@ from app.recovery import recover_interrupted_jobs
 from app.routers import auth, system, jobs, salesforce, hubspot, slack, analytics
 
 
+def _maybe_start_embedded_mocks() -> None:
+    """One-command dev: run the mock HTTP services in-process unless an external URL is configured."""
+    from app.config import settings
+
+    if settings.mock_services_url or os.getenv("DISABLE_EMBEDDED_MOCKS"):
+        return
+    if not settings.salesforce_mock_enabled:
+        return
+    from mock_services.embedded import port_in_use, start_in_thread
+
+    if port_in_use("127.0.0.1", settings.mock_services_port):
+        print(f"[MOCKS] something is already listening on :{settings.mock_services_port}; using it")
+        return
+    start_in_thread(settings.mock_services_port)
+    print(f"[MOCKS] mock services listening on http://127.0.0.1:{settings.mock_services_port}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    _maybe_start_embedded_mocks()
     if not os.getenv("DISABLE_RECOVERY"):
         recover_interrupted_jobs()
     yield

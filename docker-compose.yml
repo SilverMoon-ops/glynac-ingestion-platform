@@ -7,6 +7,8 @@ services:
     ports:
       - "8000:8000"
     depends_on:
+      mock-services:
+        condition: service_started
       minio:
         condition: service_healthy
       clickhouse:
@@ -21,11 +23,21 @@ services:
       CLICKHOUSE_PORT: 8123
       DATABASE_URL: sqlite:///data/glynac.db
       SALESFORCE_MOCK_ENABLED: "true"
+      MOCK_SERVICES_URL: http://mock-services:9000
       HUBSPOT_MOCK_ENABLED: "true"
     volumes:
       - ./data:/app/data
       - ./.dlt_pipelines:/app/.dlt_pipelines
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    networks:
+      - glynac-network
+
+  mock-services:
+    build: .
+    container_name: glynac-mock-services
+    command: python -m mock_services
+    ports:
+      - "9000:9000"
     networks:
       - glynac-network
 

@@ -8,3 +8,11 @@ class InfrastructureUnavailable(RuntimeError):
 
 class ConfigurationError(RuntimeError):
     """The settings ask for something that cannot work as configured."""
+
+
+class TransientError(Exception):
+    """Worth retrying: rate limits (429), server errors (5xx), dropped connections.
+
+    Permanent failures (bad credentials, 400/403/404, bad config) are NOT subclasses,
+    so they fail fast with a clear message instead of retrying for minutes.
+    """

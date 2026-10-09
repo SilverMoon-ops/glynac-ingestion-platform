@@ -73,3 +73,48 @@ def sign_request(body: bytes = b"") -> dict:
     ts = str(int(time.time()))
     sig = hmac.new(settings.hmac_secret.encode(), ts.encode() + body, hashlib.sha256).hexdigest()
     return {"X-Timestamp": ts, "X-Signature": sig}
+
+
+# ── Mock services: a real HTTP server, started once per test session ────────────
+import socket
+
+import httpx
+import pytest
+
+
+def _free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+@pytest.fixture(scope="session")
+def _mock_server():
+    from mock_services.embedded import start_in_thread
+
+    port = _free_port()
+    server = start_in_thread(port)
+    yield f"http://127.0.0.1:{port}"
+    server.should_exit = True
+
+
+@pytest.fixture(autouse=True)
+def mock_services(_mock_server, monkeypatch):
+    """Point the app at the test mock server and reset its state before every test."""
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "mock_services_url", _mock_server)
+    httpx.post(f"{_mock_server}/salesforce/_admin/reset")
+
+    class Controls:
+        url = _mock_server
+
+        @staticmethod
+        def salesforce(**config):
+            httpx.post(f"{_mock_server}/salesforce/_admin/config", json=config).raise_for_status()
+
+        @staticmethod
+        def salesforce_requests() -> list[str]:
+            return httpx.get(f"{_mock_server}/salesforce/_admin/requests").json()["requests"]
+
+    return Controls

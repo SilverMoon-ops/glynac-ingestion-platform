@@ -15,3 +15,32 @@ SALESFORCE_QUERIES = {
     "Contracts": "SELECT Id, AccountId, Status, ContractTerm, StartDate FROM Contract LIMIT 10000",
     "Assets": "SELECT Id, Name, AccountId, SerialNumber, Status, InstallDate FROM Asset LIMIT 10000",
 }
+
+import re
+
+_FROM = re.compile(r"\bFROM\s+(\w+)", re.IGNORECASE)
+_SELECT = re.compile(r"SELECT\s+(.*?)\s+FROM\b", re.IGNORECASE | re.DOTALL)
+
+
+def sobject_of(soql: str) -> str:
+    """'SELECT ... FROM Account LIMIT 1' -> 'Account'."""
+    m = _FROM.search(soql)
+    if not m:
+        raise ValueError(f"cannot find FROM clause in SOQL: {soql!r}")
+    return m.group(1)
+
+
+def fields_of(soql: str) -> list[str]:
+    m = _SELECT.search(soql)
+    if not m:
+        raise ValueError(f"cannot find SELECT list in SOQL: {soql!r}")
+    return [f.strip() for f in m.group(1).split(",") if f.strip()]
+
+
+def object_name_for_soql(soql: str) -> str:
+    """Map a SOQL query back to our object name ('Account' -> 'Accounts')."""
+    target = sobject_of(soql).lower()
+    for name, query in SALESFORCE_QUERIES.items():
+        if sobject_of(query).lower() == target:
+            return name
+    raise ValueError(f"no configured object for SOQL sobject {target!r}")

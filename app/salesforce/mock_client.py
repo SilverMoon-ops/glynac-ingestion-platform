@@ -6,15 +6,12 @@ Simulates the real Salesforce OAuth2 + Bulk API v2 job lifecycle: Create Job
 import uuid
 from typing import Optional
 
-from app.salesforce.schemas import generate_fake_records
+from app.salesforce.schemas import SALESFORCE_SCHEMAS, generate_fake_records
 
 
-class SalesforceRateLimitError(Exception):
-    """Stands in for a real Salesforce 429 Too Many Requests response."""
-
-
-class SalesforceAPIError(Exception):
-    pass
+# Same exception classes as the real client, so retry behaviour is identical.
+from app.salesforce.real_client import SalesforceAPIError, SalesforceRateLimitError  # noqa: F401
+from app.salesforce.queries import object_name_for_soql
 
 
 class MockSalesforceClient:
@@ -34,7 +31,9 @@ class MockSalesforceClient:
         """Stands in for the OAuth2 client-credentials token exchange."""
         return f"mock-access-token-{uuid.uuid4().hex}"
 
-    def create_bulk_query_job(self, object_name: str) -> dict:
+    def create_bulk_query_job(self, object_or_soql: str) -> dict:
+        """Accepts a bare object name (old tests) or the SOQL the real client sends."""
+        object_name = object_or_soql if object_or_soql in SALESFORCE_SCHEMAS else object_name_for_soql(object_or_soql)
         job_id = str(uuid.uuid4())
         self._jobs[job_id] = {"object": object_name, "polls": 0}
         return {"id": job_id, "state": "UploadComplete"}

@@ -41,6 +41,11 @@ class Settings:
     salesforce_instance_url: str = os.getenv("SALESFORCE_INSTANCE_URL", "https://login.salesforce.com")
     
     # Force mock even if real credentials are set (for testing)
+    # Mock services (mock_services/): a real HTTP server standing in for Salesforce/HubSpot/Slack.
+    # Empty URL = run it inside this process on MOCK_SERVICES_PORT; set it to use a separate container.
+    mock_services_url: str = os.getenv("MOCK_SERVICES_URL", "")
+    mock_services_port: int = int(os.getenv("MOCK_SERVICES_PORT", "9000"))
+    salesforce_results_page_size: int = int(os.getenv("SALESFORCE_RESULTS_PAGE_SIZE", "1000"))
     salesforce_mock_enabled: bool = os.getenv("SALESFORCE_MOCK_ENABLED", "true").lower() == "true"
 
     dlt_pipelines_dir: str = os.getenv("DLT_PIPELINES_DIR", "./.dlt_pipelines")
@@ -54,6 +59,11 @@ class Settings:
     hubspot_mock_latency_seconds: float = float(os.getenv("HUBSPOT_MOCK_LATENCY_SECONDS", "0.05"))
     hubspot_mock_total_records: int = int(os.getenv("HUBSPOT_MOCK_TOTAL_RECORDS", "47"))
     hubspot_mock_page_size: int = int(os.getenv("HUBSPOT_MOCK_PAGE_SIZE", "10"))
+
+
+def mock_base_url() -> str:
+    """Where the mock services listen."""
+    return (settings.mock_services_url or f"http://127.0.0.1:{settings.mock_services_port}").rstrip("/")
 
 
 settings = Settings()
