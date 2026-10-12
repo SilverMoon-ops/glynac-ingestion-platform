@@ -5,13 +5,16 @@ from pathlib import Path
 
 # ── Read secret from .env so this always matches the server ──────────────────
 env_file = Path(__file__).parent / ".env"
-SECRET = "OR!ON"   # fallback matching .env
+SECRET = os.getenv("HMAC_SECRET", "")   # never hardcode the real secret in source
 if env_file.exists():
     for line in env_file.read_text().splitlines():
         line = line.strip()
         if line.startswith("HMAC_SECRET"):
             SECRET = line.split("=", 1)[1].strip().strip('"').strip("'")
             break
+
+if not SECRET:
+    sys.exit("HMAC_SECRET is not set. Put it in .env (the same value the server uses) or export it.")
 
 BASE = os.getenv("API_BASE_URL", "http://localhost:8000")
 

@@ -1,601 +1,317 @@
-# Glynac Backend Ingestion Platform (Python)
+# Glynac Backend Ingestion Platform
 
-**Enterprise-grade backend ingestion platform** covering all three BE tasks:
-- **Task 1:** Salesforce Bulk API v2 ingestion (10+ objects)
-- **Task 2:** HubSpot dlt pipeline (8 resources, Parquet, pause/resume)
-- **Task 3:** Slack dual-mode ingestion (historical backfill + real-time streaming)
+A Python (FastAPI) service that ingests data from **Salesforce**, **HubSpot** and **Slack**, lands the raw files in **MinIO**, loads them into **ClickHouse**, and exposes curated analytical views and a web console to run and monitor everything.
 
-All tasks feature **crash recovery**, **checkpoint persistence**, **parallel execution**, and **ClickHouse analytical views**.
+| Pipeline | Source | Lands in MinIO as | ClickHouse tables |
+|---|---|---|---|
+| **BE-1 Salesforce** | Bulk API v2 (OAuth2, query jobs, paged CSV results), 10 objects | JSON, `salesforce/{object}/{org}/{date}/` | `bronze_salesforce_*` (10 tables) |
+| **BE-2 HubSpot** | CRM v3 (bearer token, cursor paging), 8 objects, loaded with **dlt**, **incremental by `updated_at`** | Parquet, `hubspot/{org}/{object}/year=/month=/` | `bronze_hubspot_*` (8 tables) |
+| **BE-3 Slack** | Web API history backfill **and** signed Events API webhooks | Parquet, `slack/historical/...` and `slack/realtime/...` | `bronze_slack_messages`, `slack_users`, `slack_channels`, `slack_files`, `slack_reactions` |
 
----
-
-## 🎬 Video Demonstration
-
-**[Watch the full platform walkthrough here](https://your-loom-link-here)** (15 mins)
-
-Demonstrates:
-- Salesforce Bulk API v2 extracting 10 objects → MinIO → ClickHouse
-- HubSpot Parquet ingestion with pause/resume and zero-duplicate recovery
-- Slack historical backfill + real-time events with per-channel checkpointing
-- Web monitoring UI and ClickHouse analytical views
-
-*To record your own: Start Docker, use `sign.py` to trigger ingestions, show MinIO console and ClickHouse queries, then upload to Loom.*
+Every source can run against a **mock server that speaks the real wire protocol over HTTP** (see [Mock services](#mock-services)), or against the real service by changing credentials and a URL. The client code is identical in both cases.
 
 ---
 
-## 📋 Shared Scaffold
+## Architecture
 
-Every ingestion service is built on common infrastructure:
+```
+  Salesforce / HubSpot / Slack          (real APIs, or mock_services over HTTP)
+              │  OAuth2 / bearer token, paging, 429 + 5xx retry with backoff
+              ▼
+   ┌──────────────────────────── FastAPI service ────────────────────────────┐
+   │  routers ─► job state machine ─► workers (threads)                       │
+   │              PENDING→RUNNING→PAUSED/COMPLETED/FAILED/CANCELLED          │
+   │  per-page checkpoints · pause/cancel stored in DB · crash recovery       │
+   │  dead-letter queue · audit log · HMAC auth + console login session       │
+   └───────┬───────────────────────────────┬─────────────────────────────────┘
+           │ one deterministic file/page   │ job + checkpoint state (SQLite)
+           ▼                               
+        MinIO  ◄────────── s3() ──────────  ClickHouse  ──►  v_hubspot_deal_pipeline
+   (raw JSON / Parquet)   reads the files   ReplacingMergeTree  v_client_360_deals
+                          itself            PARTITION BY org     v_slack_compliance_timeline
+```
 
-| Layer | What it does |
-|---|---|
-| `app/models.py` | `Job`, `DeadLetter`, `AuditLog`, `ChannelCheckpoint` tables (SQLite) |
-| `app/jobs.py` | State machine: `PENDING → RUNNING → PAUSED / COMPLETED / FAILED / CANCELLED` |
-| `app/security.py` | HMAC-SHA256 (`timestamp_bytes + body`) required on every route except `/health` |
-| `app/retry.py` | `tenacity` exponential backoff + jitter wrapping every external/mock call |
-| `app/audit.py` | Dead-letter + audit log helpers; persisted, not print statements |
-| `app/storage.py` | Pluggable: local filesystem (default) or real MinIO |
-| `app/clickhouse_sink.py` | Pluggable: in-memory NullSink (default) or real ClickHouse with type coercion |
-| `tests/` | `pytest` harness — temp DB per test, HMAC sign helper, **31/31 passing** |
+**Load path.** A worker lands a page as one file in MinIO, then gives ClickHouse the file's path. ClickHouse reads it itself with the `s3()` table function (`INSERT ... SELECT ... FROM s3(...)`). The API never inserts rows into ClickHouse directly.
 
 ---
 
-## 🚀 Quick Start
+## Quick start
 
-### Local Development (No Docker)
+### A. Local, no Docker
 
 ```bash
-# Clone and activate venv
-git clone https://github.com/SilverMoon-ops/glynac-ingestion-platform.git
-cd glynac-ingestion-platform
-python -m venv .venv
-source .venv/bin/activate  # Windows: .venv\Scripts\activate
-
-# Install dependencies
+python -m venv .venv && source .venv/bin/activate      # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 cp .env.example .env
+```
 
-# Run server
+Edit `.env`. For development without Docker set:
+
+```
+STORAGE_BACKEND=local
+CLICKHOUSE_ENABLED=false
+UI_PASSWORD=choose-a-password
+HMAC_SECRET=choose-a-long-random-secret
+```
+
+```bash
 uvicorn app.main:app --reload
-
-# In another terminal, run tests
-pytest -v   # 31/31 passing
 ```
 
-Server runs at `http://localhost:8000`
-UI at `http://localhost:8000/ui/`
+Open <http://localhost:8000/ui> and sign in with `UI_PASSWORD`. The mock services start automatically inside the API process on port 9000 (a real HTTP server).
 
-### Docker + MinIO + ClickHouse
+With `CLICKHOUSE_ENABLED=false` the data is kept in memory so the console and views still work, but it is lost on restart; use Docker for a real ClickHouse.
+
+### B. Docker (MinIO + ClickHouse + mock services)
 
 ```bash
-# Start all services
-docker compose up -d
-
-# Update .env
-STORAGE_BACKEND=minio
-CLICKHOUSE_ENABLED=true
-
-# Verify services
-curl http://localhost:9001          # MinIO console
-curl http://localhost:8123          # ClickHouse HTTP API
-curl http://localhost:8000/health   # API health
+cp .env.example .env        # set UI_PASSWORD and HMAC_SECRET
+docker compose up -d --build
+docker compose ps           # all services should be healthy
 ```
 
-### Signing Requests
+| URL | What |
+|---|---|
+| <http://localhost:8000/ui> | Monitoring console |
+| <http://localhost:8000/docs> | OpenAPI docs |
+| <http://localhost:9001> | MinIO console (login from `docker-compose.yml`: `MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD`; `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` in `.env` must match them) |
+| <http://localhost:8123/play> | ClickHouse query UI |
+| <http://localhost:9100/health> | Mock services |
 
-Every endpoint except `/health` requires `X-Timestamp` and `X-Signature` headers.
-Use the included `sign.py` helper:
+The compose file pins nothing to a specific image version (`latest`). Once it works for you, run `SELECT version()` in ClickHouse and pin that tag in `docker-compose.yml`.
+
+### Authentication
+
+* **Web console:** `POST /api/auth/login` with `UI_PASSWORD` sets an `HttpOnly`, `SameSite=Strict` session cookie. The browser never holds the HMAC secret.
+* **Scripts and other services:** every `/api/*` request is signed: `X-Timestamp` and `X-Signature = HMAC-SHA256(HMAC_SECRET, timestamp + body)`, valid for 5 minutes. `sign.py` does this for you (reads `HMAC_SECRET` from `.env`):
 
 ```bash
-python sign.py sf Accounts          # Trigger Salesforce sync
-python sign.py hs-all               # HubSpot all 8 resources in parallel
-python sign.py hs-pause-demo Contacts  # Automated pause/resume proof
-python sign.py slack-hist           # Slack historical backfill
-python sign.py slack-event          # Slack realtime idempotent event
+python sign.py sf Accounts          # start a Salesforce sync
+python sign.py hs-all               # start all 8 HubSpot objects in parallel
+python sign.py slack-hist           # start the Slack historical backfill
+python sign.py jobs                 # list jobs
+python sign.py ch-inspect v_client_360_deals
 ```
 
-The signing formula (matches `app/security.py` exactly):
-```python
-msg = timestamp.encode() + body      # byte concat, NOT string concat
-sig = hmac.new(secret.encode(), msg, hashlib.sha256).hexdigest()
-```
+* **Slack webhooks** (`POST /api/slack/events`) are authenticated by Slack's own signature (`X-Slack-Signature`, signing secret, 5-minute replay window), not by the HMAC scheme.
 
 ---
 
-## ✅ Task 1 — Salesforce Bulk API v2 (`BE-1`)
+## Configuration
 
-### Implementation Status
+All settings are environment variables (see `.env.example`).
 
-- ✅ **Real Salesforce Bulk API v2 client** with OAuth2 support (fallback to mock if credentials not set)
-- ✅ **10 distinct Salesforce objects** extracted via SOQL queries: Accounts, Contacts, Opportunities, Leads, Tasks, Cases, Products, PricebookEntries, Contracts, Assets
-- ✅ **MinIO storage** with layout: `salesforce/{object_name}/{org_id}/{date}/part-0001.json`
-- ✅ **ClickHouse tables** auto-created with proper schemas and `organisation_id` partitions
-- ✅ **Web monitoring console** at `/ui/` showing job status, row counts, error logs, pause/resume/cancel buttons
-- ✅ **Exponential backoff retry** for rate limits and network errors
-- ✅ **Dead-letter routing** for invalid records
+| Variable | Default | Purpose |
+|---|---|---|
+| `HMAC_SECRET` | dev value | Secret for signed API requests and console sessions. **Change it.** |
+| `UI_PASSWORD` | empty | Console password. Empty disables console login. |
+| `DATABASE_URL` | `sqlite:///./glynac.db` | Job, checkpoint, audit and dead-letter state |
+| `STORAGE_BACKEND` | `minio` | `minio` or `local` (files under `LOCAL_STORAGE_ROOT`) |
+| `MINIO_ENDPOINT` / `_ACCESS_KEY` / `_SECRET_KEY` / `_BUCKET` | `localhost:9000` ... | Object storage |
+| `CLICKHOUSE_ENABLED` | `true` | `false` = in-memory stand-in (development only) |
+| `CLICKHOUSE_HOST` / `_PORT` / `_USER` / `_PASSWORD` / `_DATABASE` | `localhost:8123` | ClickHouse connection |
+| `CLICKHOUSE_S3_ENDPOINT` | `http://MINIO_ENDPOINT` | Address **ClickHouse** uses to reach MinIO (Docker: `http://minio:9000`) |
+| `SALESFORCE_MOCK_ENABLED` | `true` | `true` = mock server; `false` = real Salesforce |
+| `SALESFORCE_CLIENT_ID` / `_CLIENT_SECRET` / `_INSTANCE_URL` | empty | Real Salesforce credentials |
+| `SALESFORCE_RESULTS_PAGE_SIZE` | `1000` | `maxRecords` per results request |
+| `HUBSPOT_MOCK_ENABLED` | `true` | `false` = real HubSpot |
+| `HUBSPOT_API_KEY` / `HUBSPOT_BASE_URL` | empty / `https://api.hubapi.com` | Private-app token |
+| `HUBSPOT_INCREMENTAL_OVERLAP_SECONDS` | `60` | Incremental runs re-read this far before the stored mark |
+| `SLACK_MOCK_ENABLED` | `true` | `false` = real Slack |
+| `SLACK_BOT_TOKEN` / `SLACK_SIGNING_SECRET` | empty | Real Slack credentials |
+| `MOCK_SERVICES_URL` / `MOCK_SERVICES_PORT` | empty / `9000` | Empty URL = run mocks inside the API process |
+| `API_INTERNAL_URL` | empty | Where the mock Slack delivers webhooks (Docker: `http://api:8000`) |
+| `HUBSPOT_MOCK_TOTAL_RECORDS` / `_PAGE_SIZE` / `_LATENCY_SECONDS` | `47` / `10` / `0.05` | Mock data size and speed |
+| `SLACK_MOCK_MESSAGES_PER_CHANNEL` | `50` | Mock Slack workspace size |
+| `DLT_PIPELINES_DIR` | `.dlt_pipelines` | dlt working directory |
 
-### Files
-
-```
-app/salesforce/
-├── real_client.py          # Real Salesforce Bulk API v2 HTTP client
-├── mock_client.py          # Mock for testing (deterministic failure injection)
-├── queries.py              # SOQL queries for all 10 objects
-├── schemas.py              # Per-object schemas with realistic fields
-├── ingest.py               # Orchestrator with retry + checkpoint logic
-└── routers/salesforce.py   # REST API endpoints
-```
-
-### How to Run
-
-**Mock mode (default):**
-```bash
-python sign.py sf Accounts
-```
-
-**Real Salesforce (if credentials set in .env):**
-```bash
-SALESFORCE_CLIENT_ID=your_client_id \
-SALESFORCE_CLIENT_SECRET=your_secret \
-SALESFORCE_INSTANCE_URL=https://your-org.salesforce.com \
-SALESFORCE_MOCK_ENABLED=false \
-python sign.py sf Accounts
-```
-
-### Acceptance Criteria
-
-- [x] 10+ distinct Salesforce objects extracted into MinIO
-- [x] All objects queryable in ClickHouse with correct schemas and partitions
-- [x] Web UI displays real-time job status, row counts, failure logs, manual sync trigger
-- [x] Automatic retry handling recovers from simulated API rate-limit errors
-- [x] Dead-letter routing for corrupt/invalid records
+A misconfiguration fails loudly. If MinIO or ClickHouse is configured but unreachable, jobs **fail with an actionable message** and the console shows a red banner; nothing silently falls back to local files, memory or mock data.
 
 ---
 
-## ✅ Task 2 — HubSpot Ingestion Pipeline (`BE-2`)
+## The three pipelines
 
-### Implementation Status
+### BE-1 Salesforce Bulk API v2
 
-- ✅ **`dlt` (data load tool) primary path** with filesystem destination writing Parquet files
-- ✅ **PyArrow fallback** (opt-in via `FORCE_PYARROW_FALLBACK=true`) for test environments where dlt state dir isn't available
-- ✅ **8 HubSpot resources** ingested in parallel: Contacts, Companies, Deals, Tickets, LineItems, Engagements, Pipelines, Owners
-- ✅ **Parquet columnar storage** with Snappy compression in MinIO: `hubspot/{org_id}/{object_name}/year={year}/month={month:02d}/part-{offset}.parquet`
-- ✅ **ClickHouse ReplacingMergeTree tables** with FINAL views for instant deduplicated reads
-- ✅ **Pause and Resume** with cursor-based recovery — resume from exact checkpoint, zero duplicates proven in tests
-- ✅ **Crash recovery** — process kill mid-run, restart, same cursor used, zero duplicates
-- ✅ **Parallel execution** — all 8 resources run concurrently via `ThreadPoolExecutor`
+`Accounts, Contacts, Opportunities, Leads, Tasks, Cases, Products, PricebookEntries, Contracts, Assets`.
 
-### Files
+1. OAuth2 client-credentials token.
+2. Create a Bulk query job (SOQL per object), poll status (`UploadComplete → InProgress → JobComplete`).
+3. Download results, **following `Sforce-Locator` paging**, and map Salesforce's CamelCase text columns to typed snake_case fields plus `organisation_id`.
+4. Dead-letter records without an id; land the valid ones as `salesforce/{object}/{org}/{date}/part-0001.json`.
+5. ClickHouse reads that file from MinIO into `bronze_salesforce_{object}`.
 
-```
-app/hubspot/
-├── pipeline.py             # dlt vs PyArrow path selection, Parquet writer
-├── mock_server.py          # Mock HubSpot API with deterministic pagination
-├── schemas.py              # 8 resource schemas with realistic fields
-├── ingest.py               # Orchestrator with checkpoint + dead-letter
-└── routers/hubspot.py      # REST API: /start, /start_all, /pause, /resume, /status
-```
+An expired session (401) is refreshed once automatically.
 
-### How to Run
+### BE-2 HubSpot with dlt
 
-**Single resource (Contacts):**
-```bash
-python sign.py hs Contacts
-```
+`Contacts, Companies, Deals, Tickets, LineItems, Engagements, Pipelines, Owners`. `start_all` runs all eight concurrently.
 
-**All 8 resources in parallel:**
-```bash
-python sign.py hs-all
-# Returns 8 job IDs, all running concurrently
-```
+Work is done **one page at a time**, and each page is a unit of recovery:
 
-**Automated pause/resume demo:**
-```bash
-# Set in .env: HUBSPOT_MOCK_LATENCY_SECONDS=0.4  HUBSPOT_MOCK_TOTAL_RECORDS=100
-python sign.py hs-pause-demo Contacts
-# Output shows pause at row 90, resume, final 100 rows, zero duplicates
-```
+1. Fetch a page (`limit` / `after` cursor).
+2. Land it as one Parquet file through a `dlt` filesystem pipeline, named by the page cursor: `part-{cursor}.parquet`.
+3. ClickHouse reads the file from MinIO.
+4. Cursor, row count and a `completed` flag are saved in **one database commit**.
 
-### Acceptance Criteria
+`FORCE_PYARROW_FALLBACK=true` writes the same files with pyarrow directly (CI use). dlt runs in a throwaway directory per page; the database row is the durable checkpoint.
 
-- [x] Pipeline extracts all 8 HubSpot resources into compressed Parquet in MinIO
-- [x] ClickHouse tables populated; curated analytical views with FINAL dedup
-- [x] Pause & Resume — resumes from exact checkpoint, zero duplicates proven
-- [x] Crash recovery — same cursor-based resume, proven in tests with process kill simulation
-- [x] Parallel execution — `POST /api/hubspot/start_all` runs all 8 resources concurrently
+**Incremental sync (state by `updated_at`).** The first run of an (organisation, object) is a full load. When it **completes**, the newest `hs_lastmodifieddate` it saw is stored in the `sync_state` table. Every later run asks HubSpot only for records modified since that mark, using the CRM **search** endpoint (`hs_lastmodifieddate >= mark`, oldest first, paged with `after`), so unchanged records are not re-read:
+
+* The mark moves **only when a run completes**. A paused, failed, cancelled or crashed run leaves it alone, so the next run still covers everything not yet loaded.
+* The mode and cut-off are saved in the job's checkpoint when it starts, so a resumed or crash-recovered run keeps the **same cut-off** and continues from its saved page.
+* Runs re-read a short overlap before the mark (`HUBSPOT_INCREMENTAL_OVERLAP_SECONDS`, default 60) and the boundary record itself (`>=`), so late-committed records and timestamp ties are never missed. Loads are idempotent, so this only costs a few extra rows.
+* Modified records **replace** their old row in ClickHouse (`ReplacingMergeTree`); new ones are added.
+* Each run's files carry the job id (`part-{job}-{cursor}.parquet`), so an incremental run never overwrites an earlier run's raw files.
+* **Full refresh** on demand: the console's "Full refresh" box, `"full_refresh": true` on `POST /api/hubspot/start` / `start_all`, or `DELETE /api/hubspot/sync_state/{object}` to forget the mark.
+* `Owners` and `Pipelines` have no search endpoint in HubSpot, so they always do a full refresh.
+
+The state store is our own table (`app/sync_state.py`), not dlt's internal state: dlt is used for extraction and Parquet, and its working directory is disposable.
+
+### BE-3 Slack, two modes
+
+* **Historical backfill:** one worker thread per channel, each with its own cursor checkpoint (`channel_checkpoint` table). Pulls channels, users, messages, thread replies (`conversations.replies`), file metadata and reactions. Files and reactions land as their own Parquet datasets.
+* **Real-time:** Slack POSTs signed events to `/api/slack/events`. The endpoint verifies the signature and timestamp, answers the `url_verification` challenge, ignores bot messages and edits, acknowledges immediately, and ingests in the background. Delivery is at-least-once, so ingestion is idempotent (a message id is `channel:ts`; a redelivery overwrites the same file and is not counted twice).
 
 ---
 
-## ✅ Task 3 — Slack Dual-Mode Ingestion (`BE-3`)
+## Reliability design
 
-### Implementation Status
+| Concern | How it works |
+|---|---|
+| **Job states** | `PENDING → RUNNING → PAUSED / COMPLETED / FAILED / CANCELLED`, with a transition table; invalid moves return 409. A job that fails before starting (bad config) goes `PENDING → FAILED` with the reason in `job.error`. |
+| **Checkpoints** | Written after every page, in the same commit as the row count. Resume continues from the last committed cursor. |
+| **Pause / cancel** | A request is stored in the `jobs.control` column and checked between pages, so it survives restarts and works across processes. |
+| **Crash recovery** | At startup, jobs left `RUNNING`/`PENDING` by a dead process (`jobs.owner` differs from this process) are resumed from their checkpoint. A pause or cancel requested before the crash is honoured instead. A job whose last page was already checkpointed is finalised, not re-run. |
+| **Incremental state** | Per-object `updated_at` high-water mark in `sync_state`; advances only on a completed run; a resumed run keeps its original cut-off. |
+| **No duplicates** | Landed files are named deterministically (by cursor/offset and a per-job date), so a replayed page **overwrites** its file. ClickHouse tables are `ReplacingMergeTree` keyed by id. Source ids are stable, so a re-run replaces rows. |
+| **Retries** | Exponential backoff with jitter (up to 5 attempts) for **transient** failures only: HTTP 429, 5xx, dropped connections. Bad credentials and 4xx errors fail fast with a clear message. |
+| **Dead letters** | Records without an id/organisation are stored in `dead_letters` with the reason instead of being lost or crashing the batch. |
+| **Audit** | Every state change and checkpoint is written to `audit_log` and shown per job. |
+| **Atomic counting** | Row counts are updated with SQL `row_count = row_count + n`, so parallel channel workers cannot lose updates. |
+| **Failure visibility** | One failing Slack channel fails the job and names the channel; Resume re-reads only that channel. |
 
-- ✅ **Historical Backfill mode** — parallel `ThreadPoolExecutor` with one worker thread per channel
-- ✅ **Real-time Streaming mode** — WebSocket listener + Events API idempotent event handler
-- ✅ **Per-channel independent checkpointing** — each channel stores its own cursor in `ChannelCheckpoint` table
-- ✅ **Parquet landing** in MinIO:
-  - Historical: `slack/historical/{org_id}/channel_id={channel_id}/processing_date={date}/part-{cursor}.parquet`
-  - Real-time: `slack/realtime/{org_id}/channel_id={channel_id}/processing_date={date}/{message_id}.parquet`
-  - Metadata: `slack/metadata/{org_id}/users.parquet`, `slack/metadata/{org_id}/channels.parquet`
-- ✅ **ClickHouse compliance timeline view** — joins messages + users + channels + files + reactions + threads
-- ✅ **Crash safety** — `ReplacingMergeTree FINAL` deduplicates on restart; deterministic message IDs
-- ✅ **Parallel channel processing** — multiple channels backfilled concurrently
-- ✅ **Idempotent realtime events** — same event sent twice → one file, one DB row
+The single-process assumption: recovery treats any job not owned by the current process as orphaned, so run **one API instance** with the SQLite store.
 
-### Files
+---
 
-```
-app/slack/
-├── engine.py               # Dual-mode orchestrator, per-channel checkpoints, compliance view
-├── mock_api.py             # Mock Slack API with thread replies, file metadata, reactions
-└── routers/slack.py        # REST API: /historical/start, /realtime/start, /realtime/event, /pause, /resume
-```
+## ClickHouse tables and views
 
-### How to Run
+Tables use `ReplacingMergeTree`, `ORDER BY (organisation_id, id)` and `PARTITION BY organisation_id` (Slack tables use their own keys, see `app/slack/tables.py`). Each table also has a `v_..._latest` view using `FINAL`.
 
-**Historical backfill (parallel channels):**
-```bash
-python sign.py slack-hist
-# Starts 3 channel workers in parallel
-# Each channel maintains independent cursor checkpoint
-```
+| View | Joins |
+|---|---|
+| `v_hubspot_deal_pipeline` | Deals → Companies on `company_id`, Deals → Pipelines on `pipeline` |
+| `v_client_360_deals` | Salesforce Opportunity → Account (`account_id`) → HubSpot Company (same **name**) → HubSpot Deals (`company_id`) |
+| `v_slack_compliance_timeline` | Messages + channel and user names + attached files + reactions, newest first, thread replies flagged |
 
-**Real-time event ingestion:**
-```bash
-python sign.py slack-event
-# Idempotent: send same event twice → same message_id, same file path
-```
-
-### ClickHouse Compliance Timeline View
+Views use `LEFT JOIN` with `join_use_nulls = 1`, so unmatched rows show `NULL` rather than made-up values.
 
 ```sql
-SELECT *
-FROM v_slack_compliance_timeline
-FINAL
-WHERE channel_id = 'C001'
-ORDER BY message_ts DESC;
+SELECT * FROM v_client_360_deals LIMIT 10;
+SELECT message_kind, count() FROM v_slack_compliance_timeline GROUP BY message_kind;
 ```
-
-Joins:
-- `bronze_slack_messages` (main table)
-- `slack_users` (real_name, email)
-- `slack_channels` (channel_name)
-- `slack_files` (attached_files)
-- `slack_reactions` (reactions)
-- `slack_threads` (thread_reply_count)
-
-### Acceptance Criteria
-
-- [x] Dual-mode: Historical Backfill and Real-time WebSocket/Events streaming
-- [x] Parquet files written to MinIO; queryable via ClickHouse compliance view with joins
-- [x] Pause / Resume — operational for both modes, per-channel cursor checkpointing
-- [x] Crash safety — `ReplacingMergeTree FINAL` deduplicates on restart
-- [x] Parallel processing — `ThreadPoolExecutor` runs one worker per channel concurrently
-- [x] Idempotent realtime events — same event sent twice produces one file, one DB row
 
 ---
 
-## 🧪 Testing
+## Mock services
 
-All tests pass locally without Docker:
+`mock_services/` is a standalone FastAPI app that behaves like the real services over HTTP:
 
-```bash
-pytest -v
-# 31/31 PASSED
-```
+* **Salesforce:** `/services/oauth2/token`, `/services/data/v60.0/jobs/query...` (401 on a bad session, 429 + `Retry-After`, CSV results paged with `Sforce-Locator`, only the selected columns).
+* **HubSpot:** `/crm/v3/objects/{type}` (bearer auth, `properties` as strings, `paging.next.after`, 429 + `Retry-After`). Ids derive from the offset, so a resumed run sees identical records.
+* **Slack:** `/api/conversations.history|replies|list`, `users.list`, `auth.test` (errors as HTTP 200 `ok:false`, opaque cursors, 429); and an admin endpoint that **pushes signed Events API webhooks** to the API.
 
-Test coverage:
+Run it separately with `python -m mock_services` (port 9000), or let the API start it in-process. Each service also has `/_admin/config`, `/_admin/reset` and `/_admin/requests` for tests and demos (inject 429/500 errors, change data size, inspect what was called).
 
-| Test Suite | Count | Coverage |
-|---|---|---|
-| `test_auth.py` | 4 | HMAC authentication |
-| `test_salesforce.py` | 6 | Bulk API lifecycle, retry, dead-letter |
-| `test_hubspot.py` | 8 | Pagination, pause/resume, parallel |
-| `test_slack.py` | 2 | Historical, realtime idempotence |
-| `test_jobs.py` | 4 | Job state machine, checkpointing |
-| `test_crash_recovery.py` | 2 | HubSpot + Slack per-channel recovery |
-| `test_integration_e2e.py` | 5 | End-to-end: all 10 SF objects, parallel HubSpot, Slack checkpoints |
+Sample data is relational (deals reference companies and pipelines; opportunities reference accounts; account and company names share a pool) so the views return meaningful rows.
+
+To use the real services, set `*_MOCK_ENABLED=false` and provide credentials; no code changes.
 
 ---
 
-## 📦 Verified End-to-End
+## Web console (`/ui`)
 
-| Check | Result |
+* Sign in with `UI_PASSWORD`.
+* Start syncs: any Salesforce object or all 10, any HubSpot object or all 8, Slack backfill / real-time worker / a test webhook delivered through the signed Events endpoint.
+* Jobs table: status badges, rows, duration, retries, error text; Pause, Resume, Cancel; per-job audit trail and dead letters.
+* **Table** button: inspect the job's ClickHouse table (columns and sample rows). **Analytical views** section inspects the three views.
+* **Landed files**: browse MinIO objects per service and **preview** any file (Parquet schema and first rows, JSON records).
+* A red banner appears if MinIO or ClickHouse is unreachable.
+
+---
+
+## API overview
+
+All `/api/*` routes below require a console session or an HMAC signature, except `/api/auth/*` and `/api/slack/events` (Slack-signed). `/health`, the `/ui` page itself and `/docs` are open; they expose no data.
+
+| Area | Endpoints |
 |---|---|
-| `pytest -v` 31/31 | ✅ All passing |
-| HMAC auth (valid / invalid / stale) | ✅ |
-| Salesforce 10 objects → MinIO JSON + ClickHouse | ✅ 30 rows per object |
-| HubSpot 8 objects parallel → MinIO Parquet | ✅ 8 jobs fired concurrently |
-| HubSpot pause at row 90 → resume → 100 rows, zero dupes | ✅ |
-| Slack historical backfill parallel channels | ✅ |
-| Slack realtime same event twice → 1 file, same message_id | ✅ |
-| Real MinIO bucket (Docker) — 99+ objects | ✅ |
-| Real ClickHouse tables (Docker) — rows queryable | ✅ 30 rows confirmed |
-| Web UI at `/ui/` | ✅ Monitors all jobs |
+| System | `GET /health`, `GET /api/analytics/status` |
+| Auth | `POST /api/auth/login`, `POST /api/auth/logout`, `GET /api/auth/me` |
+| Jobs | `GET /api/jobs`, `/api/jobs/stats`, `/api/jobs/{id}`, `/{id}/audit`, `/{id}/dead_letters`; `POST /{id}/pause\|resume\|cancel` |
+| Salesforce | `GET /api/salesforce/objects\|list\|status/{id}\|files\|clickhouse/{object}`; `POST /start`, `/pause/{id}`, `/resume/{id}`, `/cancel/{id}`; `DELETE /remove/{id}` |
+| HubSpot | same set, plus `POST /api/hubspot/start_all` (both accept `full_refresh`), `GET /api/hubspot/sync_state`, `DELETE /api/hubspot/sync_state/{object}` |
+| Slack | `POST /api/slack/historical/start`, `/realtime/start`, `/realtime/simulate`, `/realtime/event`, `/pause`, `/resume`, `/cancel`; `GET /list`, `/status/{id}`, `/files`, `/clickhouse/{table}`; **`POST /api/slack/events`** (Slack webhook) |
+| Analytics | `GET /api/analytics/views`, `GET /api/analytics/inspect/{view_or_table}` |
+| Storage | `GET /api/storage/preview?path=...` |
 
 ---
 
-## 🏗️ Architecture
-
-```
-                               ┌───────────────────────────────────────────────────────────┐
-                               │                    BACKEND INGESTION SUITE                │
-                               └───────────────────────────────────────────────────────────┘
-                                                             │
-            ┌────────────────────────────────────────────────┼────────────────────────────────────────────────┐
-            ▼                                                ▼                                                ▼
- ┌──────────────────────────────┐                 ┌──────────────────────────────┐                 ┌──────────────────────────────┐
- │ TASK 1: SALESFORCE BULK API  │                 │ TASK 2: HUBSPOT dlt PIPELINE │                 │ TASK 3: SLACK DUAL-MODE      │
- │ • Bulk v2 (10 Datasets)      │                 │ • dlt + Parquet + MinIO      │                 │ • Historical Backfill        │
- │ • Ingest to MinIO & ClickHouse│                 │ • ClickHouse Table & Views   │                 │ • Real-time Events Streaming │
- │ • Ingestion Control UI Panel │                 │ • Pause / Resume / Parallel  │                 │ • Pause / Resume / Checkpoint│
- └──────────────────────────────┘                 └──────────────────────────────┘                 └──────────────────────────────┘
-            │                                                │                                                │
-            └────────────────────────────────────────────────┴────────────────────────────────────────────────┘
-                                                             ▼
-                                              ┌──────────────────────────────┐
-                                              │  MinIO Storage & ClickHouse  │
-                                              │    (Parquet / External Views)│
-                                              └──────────────────────────────┘
-```
-
----
-
-## 🔄 End-to-End Ingestion Flow
-
-### Example: Salesforce → MinIO → ClickHouse
-
-```
-[ Salesforce Bulk API Job Created ]
-            ▼
-[ Bulk v2 extracts 10,000 Accounts ]
-            ▼
-[ Writes ORC/JSON to MinIO (/salesforce/accounts/{org_id}/{date}/) ]
-            ▼
-[ ClickHouse External Ingestion ]
-            ▼
-[ Auto-populates bronze_salesforce_accounts ]
-            ▼
-[ Ingestion Monitoring UI Console ]
-            ▼
-[ Operator views live status (Green), row counts (10,000), triggers pause/resume ]
-```
-
----
-
-## 📝 Environment Configuration
-
-Copy `.env.example` to `.env` and configure:
+## Testing
 
 ```bash
-# ============================================================================
-# SALESFORCE BULK API v2
-# ============================================================================
-SALESFORCE_CLIENT_ID=              # Leave blank for mock
-SALESFORCE_CLIENT_SECRET=
-SALESFORCE_INSTANCE_URL=https://login.salesforce.com
-SALESFORCE_MOCK_ENABLED=true       # Force mock even if credentials set
+pip install -r requirements.txt
+pytest -q                                   # 138 tests (about 2 minutes)
 
-# ============================================================================
-# HMAC AUTHENTICATION
-# ============================================================================
-HMAC_SECRET=change-me-to-a-real-secret
-DATABASE_URL=sqlite:///./glynac.db
-SIGNATURE_MAX_AGE_SECONDS=300
-
-# ============================================================================
-# OBJECT STORAGE: Local or MinIO
-# ============================================================================
-STORAGE_BACKEND=local              # "local" or "minio"
-LOCAL_STORAGE_ROOT=./data/objects
-MINIO_ENDPOINT=localhost:9000
-MINIO_ACCESS_KEY=glynac_admin
-MINIO_SECRET_KEY=glynac_secret_key
-MINIO_BUCKET=glynac
-MINIO_SECURE=false
-
-# ============================================================================
-# CLICKHOUSE (optional)
-# ============================================================================
-CLICKHOUSE_ENABLED=false           # true if running docker compose
-CLICKHOUSE_HOST=localhost
-CLICKHOUSE_PORT=8123
-CLICKHOUSE_USER=glynac
-CLICKHOUSE_PASSWORD=glynac_secret
-CLICKHOUSE_DATABASE=glynac
-
-# ============================================================================
-# HUBSPOT (mock settings for demos)
-# ============================================================================
-HUBSPOT_MOCK_LATENCY_SECONDS=0.05
-HUBSPOT_MOCK_TOTAL_RECORDS=47
-HUBSPOT_MOCK_PAGE_SIZE=10
-HUBSPOT_MOCK_ENABLED=true          # Force mock
-
-# ============================================================================
-# dlt PIPELINE STATE
-# ============================================================================
-DLT_PIPELINES_DIR=./.dlt_pipelines
-
-# ============================================================================
-# SLACK (optional)
-# ============================================================================
-SLACK_BOT_TOKEN=                    # Leave blank for mock
-SLACK_SIGNING_SECRET=
+pip install -r requirements-dev.txt         # adds chdb + moto for the real-ClickHouse tests
+pytest tests/test_clickhouse_real.py -q
 ```
 
----
+* **Wire-level tests** run each pipeline over real HTTP against the mock server: paging, 429/500 retry, bad credentials failing fast, session refresh, dead-lettered rows, signed webhooks, replays.
+* **Recovery tests** simulate a killed process mid-run (`SystemExit`), restart recovery, and check the final row count and file count: no duplicates, no double counting.
+* **Real-ClickHouse tests** (`tests/test_clickhouse_real.py`) use `chdb` (the actual ClickHouse engine, embedded) and `moto` (an S3-compatible server) so the production sink code runs unchanged: tables, `s3()` loads of JSON and dlt Parquet, partitions, deduplication, all three views.
+* Without `chdb`/`moto` installed, only those 20 tests skip.
+* **Real process kill:** `python scripts/crash_recovery_demo.py` boots the API as a separate process, starts 8 HubSpot jobs and a Slack backfill, sends `SIGKILL` while they are mid-run, restarts on the same database, and checks the exact row and file counts. It runs without Docker and is also part of the test suite (`tests/test_crash_demo_script.py`).
 
-## 🎯 How to Record the Video Demonstration
-
-1. **Start Docker:**
-   ```bash
-   docker compose up -d
-   ```
-
-2. **Update .env:**
-   ```bash
-   STORAGE_BACKEND=minio
-   CLICKHOUSE_ENABLED=true
-   ```
-
-3. **Open Loom or OBS recording**
-
-4. **Walkthrough (15 mins):**
-   - [0:00] Clone repo, show structure
-   - [1:00] Run `docker compose up -d`, wait for services
-   - [2:00] Show MinIO console at `http://localhost:9001`
-   - [3:00] Trigger Salesforce: `python sign.py sf Accounts` → show MinIO files
-   - [4:00] Query ClickHouse: `SELECT COUNT(*) FROM bronze_salesforce_accounts`
-   - [5:00] Trigger HubSpot all: `python sign.py hs-all` → show 8 jobs in parallel
-   - [7:00] Demonstrate pause/resume: `python sign.py hs-pause-demo Contacts`
-   - [9:00] Show Slack historical: `python sign.py slack-hist` → show Parquet files
-   - [11:00] Send realtime event, show in ClickHouse
-   - [13:00] Query compliance view: `SELECT * FROM v_slack_compliance_timeline FINAL`
-   - [15:00] Show web UI dashboard
-
-5. **Upload to Loom** and replace the link in this README
+See `VERIFICATION_REPORT.md` for requirement-by-requirement evidence and what is *not* verified.
 
 ---
 
-## 📂 Project Structure
+## Known limitations
+
+* HubSpot **Owners** and **Pipelines** use dedicated endpoints with a different response shape in the real API; the client treats all eight objects uniformly via `/crm/v3/objects`. Real-HubSpot use needs a per-object path and mapping for those two.
+* Real HubSpot deals need the company association requested to populate `company_id`; the mock supplies it.
+* Incremental sync does **not detect deletions** (HubSpot's search returns modified records, not removed ones); use a full refresh to reconcile. HubSpot's search API caps one query at 10,000 results, so a very large first change set may need a full refresh. The mock does not enforce that cap.
+* `v_client_360_deals` links Salesforce and HubSpot by **company name**; production data would be better matched on a shared key such as domain.
+* One API instance only (SQLite state and process-ownership recovery).
+* The load query contains the MinIO keys; for production use ClickHouse named collections.
+* Slack resume uses the default page size (cursors are valid for any page size).
+* Not tested against live Salesforce, HubSpot, Slack, or a Docker ClickHouse/MinIO; see the verification report.
+
+---
+
+## Project layout
 
 ```
-glynac-ingestion-platform/
-├── Dockerfile                      # Docker build for API service
-├── docker-compose.yml              # MinIO + ClickHouse + API
-├── requirements.txt                # Python dependencies
-├── .env.example                    # Configuration template
-├── sign.py                         # HMAC signing helper for testing
-├── README.md                       # This file
-│
-├── app/
-│   ├── main.py                     # FastAPI app entry point
-│   ├── database.py                 # SQLAlchemy setup
-│   ├── models.py                   # Job, DeadLetter, AuditLog, ChannelCheckpoint
-│   ├── config.py                   # Settings from .env
-│   ├── security.py                 # HMAC authentication
-│   ├── retry.py                    # Exponential backoff wrapper
-│   ├── audit.py                    # Dead-letter + audit helpers
-│   ├── storage.py                  # Pluggable storage (local/MinIO)
-│   ├── jobs.py                     # Job state machine
-│   ├── clickhouse_sink.py           # Pluggable ClickHouse (null/real)
-│   │
-│   ├── salesforce/
-│   │   ├── real_client.py          # Real Salesforce Bulk API v2
-│   │   ├── mock_client.py          # Mock client
-│   │   ├── queries.py              # SOQL queries (10 objects)
-│   │   ├── schemas.py              # Per-object schemas
-│   │   ├── ingest.py               # Orchestrator
-│   │   └── routers/salesforce.py   # REST endpoints
-│   │
-│   ├── hubspot/
-│   │   ├── pipeline.py             # dlt vs PyArrow selector
-│   │   ├── mock_server.py          # Mock HubSpot API
-│   │   ├── schemas.py              # 8 resource schemas
-│   │   ├── ingest.py               # Orchestrator
-│   │   └── routers/hubspot.py      # REST endpoints
-│   │
-│   ├── slack/
-│   │   ├── engine.py               # Dual-mode ingestion
-│   │   ├── mock_api.py             # Mock Slack API
-│   │   └── routers/slack.py        # REST endpoints
-│   │
-│   ├── routers/
-│   │   └── health.py               # Health check endpoint
-│   │
-│   └── static/
-│       └── index.html              # Web UI dashboard
-│
-├── tests/
-│   ├── conftest.py                 # pytest fixtures
-│   ├── test_auth.py                # HMAC auth tests (4)
-│   ├── test_salesforce.py          # Salesforce tests (6)
-│   ├── test_hubspot.py             # HubSpot tests (8)
-│   ├── test_slack.py               # Slack tests (2)
-│   ├── test_jobs.py                # Job state machine (4)
-│   ├── test_crash_recovery.py      # Crash recovery (2)
-│   └── test_integration_e2e.py     # End-to-end (5)
-│
-└── data/
-    ├── objects/                    # Local storage (when STORAGE_BACKEND=local)
-    └── glynac.db                   # SQLite database
+app/
+  main.py               app, startup (recovery, embedded mocks), error handling
+  config.py  models.py  database.py  security.py  errors.py  retry.py
+  jobs.py               state machine and checkpoints
+  sync_state.py         incremental-sync high-water marks
+  control.py            persistent pause/cancel + process ownership
+  recovery.py           startup crash recovery
+  audit.py              audit log + dead letters
+  storage.py            MinIO / local storage
+  clickhouse_sink.py    s3() loader, tables, views, in-memory stand-in
+  salesforce/           client, mapper, queries, ingest
+  hubspot/              client, pipeline (dlt), schemas, ingest
+  slack/                client, engine, events (signature), tables
+  routers/              HTTP routes
+  static/index.html     web console
+mock_services/          standalone mock Salesforce / HubSpot / Slack
+tests/                  138 tests
+scripts/                crash_recovery_demo.py (kill -9 proof)
+sign.py                 HMAC-signed request CLI
+docker-compose.yml  Dockerfile  requirements*.txt  .env.example
 ```
-
----
-
-## 🚦 Roadmap
-
-- [x] Day 0 — shared scaffold (job state machine, auth, retry, audit, tests)
-- [x] Day 1 — Salesforce Bulk API v2 service + UI
-- [x] Day 2 — HubSpot pipeline — all 8 resources + parallel `start_all`
-- [x] Day 3 — Slack dual-mode ingestion — parallel channel workers + WebSocket streaming
-- [ ] Day 4 — Record and link video demonstration
-
----
-
-## ❓ FAQ
-
-### Q: Can I use real Salesforce/HubSpot/Slack without Docker?
-
-**A:** Yes! The platform works in both modes:
-- **Mock mode (default):** No credentials needed, fast testing
-- **Real mode:** Set credentials in `.env`, uses actual APIs
-
-ClickHouse is always optional — MinIO landing still works without it.
-
-### Q: What if a worker crashes mid-ingestion?
-
-**A:** The platform resumes from the last checkpoint:
-- **Salesforce:** Resumes from last bulk job stage
-- **HubSpot:** Resumes from saved cursor (zero duplicates, verified in tests)
-- **Slack:** Per-channel checkpoints — each channel resumes independently
-
-### Q: How do I pause a running job?
-
-**A:** Via the REST API:
-```bash
-curl -X POST http://localhost:8000/api/hubspot/pause/{job_id} \
-  -H "$(python sign.py --headers)"
-```
-
-Or use the web UI at `http://localhost:8000/ui/`
-
-### Q: Can I run multiple tasks in parallel?
-
-**A:** Yes! HubSpot and Slack both support parallel execution:
-- HubSpot: `POST /api/hubspot/start_all` — fires 8 workers concurrently
-- Slack: Historical backfill — one worker per channel in parallel
-
-### Q: What's the difference between mock and real clients?
-
-**A:** Mock clients:
-- No external API calls
-- Deterministic failure injection for testing
-- Fast (useful for demos with delays)
-
-Real clients:
-- Actual HTTP requests to external APIs
-- Require valid credentials
-- Rate-limit handling with exponential backoff
-
----
-
-## 📜 License
-
-MIT
-
----
-
-## 🎓 Key Concepts Demonstrated
-
-✅ **Checkpoint-based crash recovery** — Resume from exact offset after process kill
-✅ **Pluggable backends** — Switch between mock, local storage, MinIO, ClickHouse
-✅ **Per-resource parallelism** — Run multiple ingestions concurrently
-✅ **Pause/resume controls** — Operational controls on running jobs
-✅ **Dead-letter queues** — Route invalid records, don't fail the job
-✅ **Deterministic state** — Same input → same output, proves zero duplicates
-✅ **Type coercion** — Safe ClickHouse type conversions
-✅ **Exponential backoff** — Handle API rate limits gracefully
-✅ **HMAC authentication** — Secure REST APIs
-✅ **Parquet + Snappy compression** — Efficient columnar storage

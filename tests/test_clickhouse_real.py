@@ -154,3 +154,17 @@ def test_a_clickhouse_read_failure_fails_the_job_visibly(db_session, mock_servic
     db_session.expire_all()
     failed = db_session.query(Job).get(job.id)
     assert failed.status == JobStatus.FAILED.value and failed.error  # not a silent success
+
+
+def test_incremental_update_replaces_the_changed_row_in_clickhouse(db_session, mock_services, real_clickhouse, monkeypatch):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "hubspot_incremental_overlap_seconds", 0)
+    _hs(db_session, "Companies")
+    mock_services.hubspot_modify("companies", [3], name="Renamed Co")
+    mock_services.hubspot(total_records=50)  # and three new records
+    second = _hs(db_session, "Companies")
+    assert second.row_count == 5  # 1 modified + 3 new + the boundary record, not all 50
+    assert real_clickhouse.command("SELECT count() FROM bronze_hubspot_companies FINAL") == 50
+    name = real_clickhouse.command("SELECT name FROM bronze_hubspot_companies FINAL WHERE id = 'companies-mock-org-3'")
+    assert name == "Renamed Co"  # the old row was replaced, not duplicated

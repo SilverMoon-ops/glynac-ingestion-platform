@@ -6,6 +6,7 @@ from app.config import mock_base_url, settings
 from app.errors import ConfigurationError, InfrastructureUnavailable
 from app.hubspot.client import HubSpotClient
 from app.retry import with_retry
+from app.sync_state import advance_high_water, get_high_water, newest, with_overlap
 from mock_services.hubspot import MOCK_HUBSPOT_TOKEN
 from app.control import claim_job
 from app.database import SessionLocal
@@ -45,12 +46,31 @@ def _make_client():
     return HubSpotClient(settings.hubspot_base_url, settings.hubspot_api_key, page_size=100)
 
 
+def _load_cursor(job) -> dict:
+    try:
+        return json.loads(job.cursor) if job.cursor and job.cursor.startswith("{") else {}
+    except ValueError:
+        return {}
+
+
+def _choose_mode(db, client, object_name: str, org_id: str, full_refresh: bool):
+    """Incremental only when the source supports it, a previous run completed, and it was not forced off."""
+    supports = getattr(client, "supports_incremental", None)  # in-process test doubles have no search
+    if full_refresh or not callable(supports) or not supports(object_name):
+        return "full", None
+    high_water = get_high_water(db, "hubspot", org_id, object_name)
+    if not high_water:
+        return "full", None
+    return "incremental", with_overlap(high_water, settings.hubspot_incremental_overlap_seconds)
+
+
 def run_hubspot_ingestion(
     job_id: str,
     object_name: str,
     org_id: str = "org1",
     client: Optional[MockHubSpotClient] = None,
     start_after: Optional[str] = None,
+    full_refresh: bool = False,
 ) -> None:
     """
     Runs synchronously in a background task/thread, same pattern as the
@@ -71,12 +91,25 @@ def run_hubspot_ingestion(
         claim_job(job_id)
         clear_pause_signal(job_id)
 
+        saved = _load_cursor(job)
+        if "mode" in saved:  # resumed / recovered: keep the decision made when the job first started
+            mode, since = saved["mode"], saved.get("since")
+        elif saved:  # a checkpoint written before incremental sync existed: finish it as a full run
+            mode, since = "full", None
+            saved.update(mode=mode, since=since)
+        else:
+            mode, since = _choose_mode(db, client, object_name, org_id, full_refresh)
+            saved = {"mode": mode, "since": since, "resume_cursor": start_after,
+                     "completed": False, "max_updated_at": None}
+            update_checkpoint(db, job, cursor=json.dumps(saved))  # persist the decision before any work
+        print(f"[SYNC] hubspot/{object_name} job={job.id[:8]} mode={mode}" + (f" since={since}" if since else ""))
+
         sink = get_clickhouse_sink()
-        state = {"table_ready": False, "dead": 0}
+        state = {"table_ready": False, "dead": 0, "max_updated": saved.get("max_updated_at")}
         created = job.created_at or datetime.now(timezone.utc)
         partition = (created.year, created.month)
 
-        def on_page(next_cursor, invalid, landed, valid_count):
+        def on_page(next_cursor, invalid, landed, valid_count, page_max):
             """Runs after each page has landed in MinIO. Rejects go to the DLQ, ClickHouse reads
             the landed file(s) from MinIO, then the checkpoint is saved."""
             for bad_record, reason in invalid:
@@ -87,26 +120,27 @@ def run_hubspot_ingestion(
                     sink.ensure_table(object_name, HUBSPOT_SCHEMAS[object_name], service="hubspot")
                     state["table_ready"] = True
                 sink.load_from_storage(object_name, HUBSPOT_SCHEMAS[object_name], landed, service="hubspot")
-            # Cursor and row count are saved in ONE commit: a crash before it
-            # replays this page without double counting.
+            state["max_updated"] = newest(state["max_updated"], page_max)
+            # Cursor, row count and the newest timestamp seen are saved in ONE commit: a crash
+            # before it replays this page without double counting.
             update_checkpoint(
                 db, job,
-                cursor=json.dumps({"resume_cursor": next_cursor, "completed": next_cursor is None}),
+                cursor=json.dumps({
+                    "mode": mode, "since": since, "resume_cursor": next_cursor,
+                    "completed": next_cursor is None, "max_updated_at": state["max_updated"],
+                }),
                 row_count_delta=valid_count,
             )
             print(f"[CHECKPOINT] hubspot/{object_name} job={job.id[:8]} next_cursor={next_cursor} rows={job.row_count}")
 
-        try:
-            saved = json.loads(job.cursor) if job.cursor and job.cursor.startswith("{") else {}
-        except ValueError:
-            saved = {}
         if saved.get("completed"):
             # Every page was already landed and checkpointed; the process died
             # before marking the job done. Re-running would double count.
             progress = {"completed": True, "pages": 0}
         else:
             progress = run_hubspot_sync(
-                object_name, org_id, job_id, client, start_after, on_page=on_page, partition=partition
+                object_name, org_id, job_id, client, start_after, on_page=on_page, partition=partition,
+                since=since, run_label=job.id[:8],
             )
 
         db.refresh(job)
@@ -119,9 +153,13 @@ def run_hubspot_ingestion(
         if progress.get("paused"):
             transition(db, job, JobStatus.PAUSED, detail=f"paused; resume_cursor={progress.get('resume_cursor')}")
         else:
+            # Only a finished run moves the high-water mark: a paused, failed or cancelled run
+            # leaves it alone, so the next run still covers everything not yet loaded.
+            advance_high_water(db, "hubspot", org_id, object_name, state["max_updated"])
             transition(
                 db, job, JobStatus.COMPLETED,
-                detail=f"{job.row_count} rows landed in {progress.get('pages', 0)} pages, {state['dead']} dead-lettered",
+                detail=(f"{mode} sync: {job.row_count} rows landed in {progress.get('pages', 0)} pages, "
+                        f"{state['dead']} dead-lettered"),
             )
     except Exception as exc:  # noqa: BLE001 — top-level job boundary, same pattern as Salesforce
         job = get_job_or_404(db, job_id)

@@ -8,7 +8,7 @@ from fastapi.staticfiles import StaticFiles
 from app.database import init_db
 from app.errors import InfrastructureUnavailable
 from app.recovery import recover_interrupted_jobs
-from app.routers import auth, system, jobs, salesforce, hubspot, slack, slack_events, analytics
+from app.routers import auth, system, jobs, salesforce, hubspot, slack, slack_events, analytics, storage_browser
 
 
 def _maybe_start_embedded_mocks() -> None:
@@ -56,6 +56,7 @@ app.include_router(salesforce.router)
 app.include_router(hubspot.router)
 app.include_router(slack.router)
 app.include_router(slack_events.router)
+app.include_router(storage_browser.router)
 app.include_router(analytics.router)
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")

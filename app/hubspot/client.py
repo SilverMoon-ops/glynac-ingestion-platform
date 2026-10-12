@@ -30,6 +30,15 @@ OBJECT_TYPES = {
 }
 _NOT_PROPERTIES = {"id", "organisation_id"}
 
+# Our column name -> HubSpot property name, where they differ. HubSpot's last-modified
+# timestamp is `hs_lastmodifieddate`, and it is what the search API filters and sorts on.
+PROPERTY_ALIASES = {"updated_at": "hs_lastmodifieddate"}
+MODIFIED_PROPERTY = "hs_lastmodifieddate"
+
+# The CRM search endpoint (needed for "modified since") exists for these only. Real HubSpot
+# serves Owners and Pipelines from endpoints with no search, so they always do a full refresh.
+INCREMENTAL_OBJECTS = {"Contacts", "Companies", "Deals", "Tickets", "LineItems", "Engagements"}
+
 
 class HubSpotError(Exception):
     """Permanent HubSpot failure (never retried)."""
@@ -90,7 +99,7 @@ def normalise_results(raw_results: list[dict], object_name: str, org_id: str) ->
     out = []
     for item in raw_results:
         props = item.get("properties") or {}
-        record = {name: _coerce(props.get(name), types.get(name, "string")) for name in types}
+        record = {name: _coerce(props.get(PROPERTY_ALIASES.get(name, name)), types.get(name, "string")) for name in types}
         record["id"] = item.get("id")
         if record.get("updated_at") is None and "updated_at" in types:
             record["updated_at"] = item.get("updatedAt")
@@ -119,13 +128,46 @@ class HubSpotClient:
         """Private-app tokens have no exchange step; verify the token with a cheap call."""
         self._get("account-info/v3/details", "token check")
 
-    def fetch_page(self, object_name: str, after: Optional[str], org_id: str = "org1") -> dict:
-        """Returns {"results": [typed records], "paging": {"next": {"after": ...}} | None}."""
-        props = ",".join(n for n, _ in HUBSPOT_SCHEMAS[object_name] if n not in _NOT_PROPERTIES)
-        resp = self._get(
-            f"crm/v3/objects/{OBJECT_TYPES[object_name]}", f"list {object_name}",
-            limit=self.page_size, after=after, properties=props,
+    def supports_incremental(self, object_name: str) -> bool:
+        return object_name in INCREMENTAL_OBJECTS
+
+    def _post(self, path: str, what: str, body: dict) -> requests.Response:
+        resp = requests.post(
+            f"{self.base_url}/{path}",
+            headers={"Authorization": f"Bearer {self.token}", "Accept": "application/json"},
+            json=body, timeout=30,
         )
+        _raise_for_status(resp, what)
+        return resp
+
+    def fetch_page(self, object_name: str, after: Optional[str], org_id: str = "org1",
+                   since: Optional[str] = None) -> dict:
+        """
+        Returns {"results": [typed records], "paging": {"next": {"after": ...}} | None}.
+
+        With `since` (ISO timestamp) only records modified at or after it are returned, oldest
+        first, via the CRM search endpoint. Without it, the full list endpoint is used.
+        """
+        props = [PROPERTY_ALIASES.get(n, n) for n, _ in HUBSPOT_SCHEMAS[object_name] if n not in _NOT_PROPERTIES]
+        path = f"crm/v3/objects/{OBJECT_TYPES[object_name]}"
+        if since:
+            if not self.supports_incremental(object_name):
+                raise HubSpotAPIError(f"{object_name} does not support incremental sync; use a full refresh")
+            from app.sync_state import parse_ts
+
+            body = {
+                "filterGroups": [{"filters": [
+                    {"propertyName": MODIFIED_PROPERTY, "operator": "GTE",
+                     "value": str(int(parse_ts(since).timestamp() * 1000))}
+                ]}],
+                "sorts": [{"propertyName": MODIFIED_PROPERTY, "direction": "ASCENDING"}],
+                "properties": props, "limit": self.page_size,
+            }
+            if after:
+                body["after"] = after
+            resp = self._post(f"{path}/search", f"search {object_name}", body)
+        else:
+            resp = self._get(path, f"list {object_name}", limit=self.page_size, after=after, properties=",".join(props))
         body = resp.json()
         return {
             "results": normalise_results(body.get("results", []), object_name, org_id),

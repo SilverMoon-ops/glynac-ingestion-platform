@@ -129,6 +129,13 @@ def mock_services(_mock_server, monkeypatch):
             httpx.post(f"{_mock_server}/hubspot/_admin/config", json=config).raise_for_status()
 
         @staticmethod
+        def hubspot_modify(object_type="companies", offsets=(), updated_at=None, **set_fields):
+            body = {"object_type": object_type, "offsets": list(offsets), "set": set_fields}
+            if updated_at:
+                body["updated_at"] = updated_at
+            httpx.post(f"{_mock_server}/hubspot/_admin/modify", json=body).raise_for_status()
+
+        @staticmethod
         def hubspot_requests() -> list[str]:
             return httpx.get(f"{_mock_server}/hubspot/_admin/requests").json()["requests"]
 

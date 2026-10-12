@@ -60,6 +60,8 @@ class Settings:
     # How the mock Slack server reaches this API to deliver Events API webhooks
     # (in Docker this is http://api:8000; empty = derive from the incoming request).
     api_internal_url: str = os.getenv("API_INTERNAL_URL", "")
+    # Incremental HubSpot sync re-reads this many seconds before the stored high-water mark.
+    hubspot_incremental_overlap_seconds: int = int(os.getenv("HUBSPOT_INCREMENTAL_OVERLAP_SECONDS", "60"))
     hubspot_base_url: str = os.getenv("HUBSPOT_BASE_URL", "https://api.hubapi.com")
     hubspot_api_key: str = os.getenv("HUBSPOT_API_KEY", "")
     hubspot_mock_enabled: bool = os.getenv("HUBSPOT_MOCK_ENABLED", "true").lower() == "true"

@@ -43,7 +43,7 @@ dialog::backdrop{background:#0008}pre{overflow:auto;max-height:50vh;background:v
  <div class="card"><h3>Salesforce Bulk API v2</h3><p class="sub">Pick an object, or run all 10.</p>
   <div class="row"><select id="sfObj"></select><button class="p" data-act="sf-start">Sync</button><button data-act="sf-all">Sync all</button></div><div class="msg" id="sfMsg"></div></div>
  <div class="card"><h3>HubSpot dlt pipeline</h3><p class="sub">Parquet to MinIO, parallel workers.</p>
-  <div class="row"><select id="hsObj"></select><button class="p" data-act="hs-start">Start</button><button data-act="hs-all">Start all 8</button></div><div class="msg" id="hsMsg"></div></div>
+  <div class="row"><select id="hsObj"></select><button class="p" data-act="hs-start">Start</button><button data-act="hs-all">Start all 8</button></div><label class="sub" title="Ignore the saved last-modified mark and re-read every record"><input type="checkbox" id="hsFull"> Full refresh</label><div class="msg" id="hsMark"></div><div class="msg" id="hsMsg"></div></div>
  <div class="card"><h3>Slack dual-mode</h3><p class="sub">Historical backfill or live stream.</p>
   <div class="row"><button class="p" data-act="sl-hist">Backfill</button><button data-act="sl-live">Start realtime</button><button data-act="sl-event">Send test event</button></div><div class="msg" id="slMsg"></div></div>
 </div>
@@ -53,7 +53,7 @@ dialog::backdrop{background:#0008}pre{overflow:auto;max-height:50vh;background:v
 <div class="wrap"><table><thead><tr><th>Service / object</th><th>Status</th><th>Rows</th><th>Time</th><th>Retries</th><th>Error</th><th>Actions</th></tr></thead><tbody id="jobs"></tbody></table></div>
 
 <h2>ClickHouse analytical views</h2><div class="grid g3" id="views"></div>
-<h2>Landed files (MinIO)</h2><div class="card"><div class="row"><select id="fsvc"><option>salesforce</option><option>hubspot</option><option>slack</option></select><button data-act="files">Load files</button></div><pre id="files">Choose a service and load.</pre></div>
+<h2>Landed files (MinIO)</h2><div class="card"><div class="row"><select id="fsvc"><option>salesforce</option><option>hubspot</option><option>slack</option></select><button data-act="files">Load files</button></div><div id="files" class="sub">Choose a service and load.</div></div>
 </main>
 <dialog id="dlg"><div class="row" style="justify-content:space-between"><h3 id="dlgTitle" style="margin:0"></h3><button data-act="close">Close</button></div><div id="dlgBody"></div></dialog>
 
@@ -91,6 +91,8 @@ async function refresh(){
     $("chipStore").textContent="storage: "+sys.storage_type;$("chipCH").textContent="clickhouse: "+sys.clickhouse_mode;
     const f=$("filter").value,list=jobs.filter(j=>!f||j.service===f);
     $("jobs").innerHTML=list.length?list.map(row).join(""):`<tr><td colspan="7" class="sub">No jobs yet. Start one above.</td></tr>`;
+    try{const m=await api("/api/hubspot/sync_state?org_id="+encodeURIComponent(ORG()));
+      $("hsMark").textContent=m.states.length?"Incremental up to date as of: "+m.states.map(x=>x.object_name+" "+x.high_water_mark.slice(0,19).replace("T"," ")).join(" · "):"No incremental mark yet: the first run loads everything.";}catch{}
     $("updated").textContent="updated "+new Date().toLocaleTimeString();
   }catch(e){$("updated").textContent=e.message}
 }
@@ -122,13 +124,13 @@ const ORG=()=>$("org").value||"org1";
 const actions={
   "sf-start":()=>run("sfMsg",async()=>{const j=await post("/api/salesforce/start",{object_name:$("sfObj").value,org_id:ORG()});return "Started "+j.id.slice(0,8)}),
   "sf-all":()=>run("sfMsg",async()=>{const os=[...$("sfObj").options].map(o=>o.value);await Promise.all(os.map(o=>post("/api/salesforce/start",{object_name:o,org_id:ORG()})));return "Started "+os.length+" jobs"}),
-  "hs-start":()=>run("hsMsg",async()=>{const j=await post("/api/hubspot/start",{object_name:$("hsObj").value,org_id:ORG()});return "Started "+j.id.slice(0,8)}),
-  "hs-all":()=>run("hsMsg",async()=>{const r=await post("/api/hubspot/start_all",{org_id:ORG()});return r.message}),
+  "hs-start":()=>run("hsMsg",async()=>{const j=await post("/api/hubspot/start",{object_name:$("hsObj").value,org_id:ORG(),full_refresh:$("hsFull").checked});return "Started "+j.id.slice(0,8)}),
+  "hs-all":()=>run("hsMsg",async()=>{const r=await post("/api/hubspot/start_all",{org_id:ORG(),full_refresh:$("hsFull").checked});return r.message}),
   "sl-hist":()=>run("slMsg",async()=>{const j=await post("/api/slack/historical/start",{org_id:ORG(),page_size:10});return "Backfill "+j.id.slice(0,8)}),
   "sl-live":()=>run("slMsg",async()=>{const j=await post("/api/slack/realtime/start",{org_id:ORG()});return "Realtime worker "+j.id.slice(0,8)}),
   "sl-event":()=>run("slMsg",async()=>{const r=await post("/api/slack/realtime/simulate",{channel_id:"C001",user_id:"U001",text:"Test compliance message"});return "Slack webhook delivered: HTTP "+r.status_code+" "+(r.response.status||"")}),
   refresh,close:()=>$("dlg").close(),
-  files:async()=>{const s=$("fsvc").value;try{const r=await api(`/api/${s}/files`);$("files").textContent=r.files.length?r.files.join("\n"):"No files landed yet."}catch(e){$("files").textContent=e.message}},
+  files:async()=>{const s=$("fsvc").value;try{const r=await api(`/api/${s}/files`);$("files").innerHTML=r.files.length?r.files.map(f=>`<div><button data-act="preview" data-path="${esc(f)}" class="mono">${esc(f)}</button></div>`).join(""):"No files landed yet."}catch(e){$("files").textContent=e.message}},
 };
 document.addEventListener("click",async e=>{
   const b=e.target.closest("[data-act]");if(!b)return;
@@ -136,6 +138,9 @@ document.addEventListener("click",async e=>{
   try{
     if(a.startsWith("job-")){b.disabled=true;await post(`/api/${svc}/${a.slice(4)}/${b.dataset.job}`);refresh();return}
     if(a==="inspect"){const o=svc==="slack"?b.dataset.obj:b.dataset.obj;const d=await api(`/api/${svc}/clickhouse/${encodeURIComponent(o)}`);modal(svc+" table",tableHtml(d));return}
+    if(a==="preview"){const d=await api("/api/storage/preview?path="+encodeURIComponent(b.dataset.path));
+      const cols=d.columns.map(c=>c.name);
+      modal(d.path,`<p>${esc(d.format)} · ${esc(d.size_bytes)} bytes${d.num_rows!=null?" · "+esc(d.num_rows)+" rows":""}</p>`+(d.format==="text"?`<pre>${esc(d.text)}</pre>`:`<p class="sub">Columns: ${d.columns.map(c=>esc(c.name)+" ("+esc(c.type)+")").join(", ")}</p><div class="wrap"><table><thead><tr>${cols.map(c=>`<th>${esc(c)}</th>`).join("")}</tr></thead><tbody>${d.rows.map(r=>`<tr>${cols.map(c=>`<td class="mono">${esc(typeof r[c]==="object"?JSON.stringify(r[c]):r[c])}</td>`).join("")}</tr>`).join("")}</tbody></table></div>`));return}
     if(a==="view"){modal(b.dataset.name,tableHtml(await api("/api/analytics/inspect/"+encodeURIComponent(b.dataset.name))));return}
     if(a==="logs"){const [au,dl]=await Promise.all([api(`/api/jobs/${b.dataset.job}/audit`),api(`/api/jobs/${b.dataset.job}/dead_letters`)]);
       modal("Job logs",`<h3>Audit trail</h3><pre>${esc(au.map(x=>`${x.created_at}  ${x.event}  ${x.detail||""}`).join("\n")||"No events")}</pre><h3>Dead letters (${dl.length})</h3><pre>${esc(dl.map(x=>`${x.reason}: ${x.record}`).join("\n")||"None")}</pre>`);return}

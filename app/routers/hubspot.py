@@ -27,6 +27,7 @@ from app.clickhouse_sink import get_clickhouse_sink
 from app.hubspot.schemas import HUBSPOT_SCHEMAS
 from app.hubspot.ingest import run_hubspot_ingestion
 from app.hubspot.pipeline import signal_pause
+from app.sync_state import list_states, reset_high_water
 
 router = APIRouter(
     prefix="/api/hubspot",
@@ -38,10 +39,12 @@ router = APIRouter(
 class StartIngestionRequest(BaseModel):
     object_name: str
     org_id: str = "org1"
+    full_refresh: bool = False  # ignore the stored high-water mark and re-read everything
 
 
 class StartAllRequest(BaseModel):
     org_id: str = "org1"
+    full_refresh: bool = False
 
 
 @router.get("/objects")
@@ -61,7 +64,9 @@ def start_ingestion(
             detail=f"Unsupported object '{payload.object_name}'. See /api/hubspot/objects.",
         )
     job = create_job(db, service="hubspot", object_name=payload.object_name, org_id=payload.org_id)
-    background_tasks.add_task(run_hubspot_ingestion, job.id, payload.object_name, payload.org_id)
+    background_tasks.add_task(
+        run_hubspot_ingestion, job.id, payload.object_name, payload.org_id, full_refresh=payload.full_refresh
+    )
     return job
 
 
@@ -84,14 +89,15 @@ def start_all_ingestion(
         job = create_job(db, service="hubspot", object_name=object_name, org_id=payload.org_id)
         jobs_created.append({"job_id": job.id, "object_name": object_name})
 
-    def _run_parallel(jobs_meta: list, org_id: str):
+    def _run_parallel(jobs_meta: list, org_id: str, full_refresh: bool):
         """Spawns one thread per resource; each opens its own DB session."""
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=len(jobs_meta), thread_name_prefix="hubspot-worker"
         ) as executor:
             futures = {
                 executor.submit(
-                    run_hubspot_ingestion, meta["job_id"], meta["object_name"], org_id
+                    run_hubspot_ingestion, meta["job_id"], meta["object_name"], org_id,
+                    full_refresh=full_refresh,
                 ): meta
                 for meta in jobs_meta
             }
@@ -104,7 +110,7 @@ def start_all_ingestion(
                     # run_hubspot_ingestion; just surface it here too.
                     print(f"[PARALLEL] {meta['object_name']} worker failed: {exc}")
 
-    background_tasks.add_task(_run_parallel, jobs_created, payload.org_id)
+    background_tasks.add_task(_run_parallel, jobs_created, payload.org_id, payload.full_refresh)
     return {
         "message": f"Parallel ingestion started for {len(jobs_created)} resources",
         "org_id": payload.org_id,
@@ -194,3 +200,15 @@ def browse_landed_files(object_name: Optional[str] = None):
 def inspect_clickhouse_table(object_name: str):
     sink = get_clickhouse_sink()
     return sink.inspect_table(object_name, service="hubspot")
+
+
+@router.get("/sync_state")
+def get_sync_state(org_id: Optional[str] = None, db: Session = Depends(get_db)):
+    """Incremental-sync high-water marks: what each (organisation, object) has been loaded up to."""
+    return {"states": list_states(db, service="hubspot", org_id=org_id)}
+
+
+@router.delete("/sync_state/{object_name}")
+def reset_sync_state(object_name: str, org_id: str = "org1", db: Session = Depends(get_db)):
+    """Forget the mark so the next run re-reads everything (same as starting with full_refresh)."""
+    return {"reset": reset_high_water(db, "hubspot", org_id, object_name)}

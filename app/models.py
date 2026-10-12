@@ -106,3 +106,19 @@ class ChannelCheckpoint(Base):
         # Enforce one checkpoint per channel per job
         UniqueConstraint("job_id", "channel_id", name="uq_job_channel"),
     )
+
+
+class SyncState(Base):
+    """
+    Incremental-sync state: per (service, organisation, object), the newest `updated_at`
+    that a COMPLETED run has seen. The next run asks the source only for records modified
+    since this mark. Only advances when a run finishes (never on pause, failure or cancel).
+    """
+
+    __tablename__ = "sync_state"
+
+    service = Column(String, primary_key=True)
+    org_id = Column(String, primary_key=True)
+    object_name = Column(String, primary_key=True)
+    high_water_mark = Column(String, nullable=False)  # ISO-8601, UTC
+    updated_at = Column(DateTime(timezone=True), default=_now, onupdate=_now)

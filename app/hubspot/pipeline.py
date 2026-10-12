@@ -22,14 +22,24 @@ import io
 import json
 import os
 import tempfile
+import threading
 from datetime import datetime
 from typing import Callable, Optional
+
+try:
+    # Imported once, at startup. Importing dlt for the first time from several worker threads
+    # at once (start_all runs 8 jobs in parallel) races inside pandas and fails the jobs with
+    # "partially initialized module 'pandas'".
+    import dlt
+except ImportError:
+    dlt = None
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
 from app.hubspot.mock_server import MockHubSpotClient
 from app.hubspot.schemas import validate_records
+from app.sync_state import newest
 from app.retry import with_retry
 from app.storage import get_storage
 from app.config import settings
@@ -55,8 +65,11 @@ def _fetch_page_with_retry(
     object_name: str,
     after: Optional[str],
     org_id: str,
+    since: Optional[str] = None,
 ) -> dict:
-    return client.fetch_page(object_name, after, org_id=org_id)
+    if since is None:  # in-process test doubles only implement the full-list call
+        return client.fetch_page(object_name, after, org_id=org_id)
+    return client.fetch_page(object_name, after, org_id=org_id, since=since)
 
 
 def _write_parquet(path: str, rows: list[dict]) -> None:
@@ -101,12 +114,30 @@ def _land_page_pyarrow(base_path: str, rows: list[dict]) -> list[str]:
     return [path]
 
 
+_dlt_first_run_lock = threading.Lock()
+_dlt_warmed = False
+
+
 def _land_page_dlt(base_path: str, object_name: str, rows: list[dict]) -> list[str]:
+    """
+    dlt imports parts of itself (pandas, ...) lazily during its first extract. When
+    `start_all` launches 8 jobs they all reach that first extract at the same moment and race
+    inside the import system ("partially initialized module 'pandas'"), failing the jobs.
+    So the very first run is serialised; every later run is fully parallel.
+    """
+    global _dlt_warmed
+    if _dlt_warmed:
+        return _run_dlt_page(base_path, object_name, rows)
+    with _dlt_first_run_lock:
+        result = _run_dlt_page(base_path, object_name, rows)
+        _dlt_warmed = True
+        return result
+
+
+def _run_dlt_page(base_path: str, object_name: str, rows: list[dict]) -> list[str]:
     """Run one dlt load for this page and store its Parquet under a deterministic name."""
-    try:
-        import dlt
-    except ImportError as exc:  # fail loudly; the pyarrow path is opt-in only
-        raise RuntimeError("dlt is not installed. Install it or set FORCE_PYARROW_FALLBACK=true.") from exc
+    if dlt is None:  # fail loudly; the pyarrow path is opt-in only
+        raise RuntimeError("dlt is not installed. Install it or set FORCE_PYARROW_FALLBACK=true.")
 
     table = object_name.lower()
     storage = get_storage()
@@ -141,8 +172,10 @@ def run_hubspot_sync(
     job_id: str,
     client: MockHubSpotClient,
     start_after: Optional[str] = None,
-    on_page: Optional[Callable[[Optional[str], list, list, int], None]] = None,
+    on_page: Optional[Callable[[Optional[str], list, list, int, Optional[str]], None]] = None,
     partition: Optional[tuple[int, int]] = None,
+    since: Optional[str] = None,
+    run_label: str = "",
 ) -> dict:
     """
     Entry point called by ingest.py.
@@ -172,15 +205,21 @@ def run_hubspot_sync(
             progress["resume_cursor"] = current
             return progress
 
-        page = _fetch_page_with_retry(client, object_name, current, org_id)
+        page = _fetch_page_with_retry(client, object_name, current, org_id, since)
         results = page.get("results", [])
+        page_max = None
+        for r in results:  # newest modification time seen, for the incremental high-water mark
+            page_max = newest(page_max, r.get("updated_at") if isinstance(r.get("updated_at"), str) else None)
         valid, invalid = validate_records(results)
         landable = [_normalise(r) for r in valid]
         landed: list[str] = []
         if landable:
+            # The run label keeps one run's files from overwriting another's (an incremental run
+            # in the same month as a full run); a replay of the SAME run still overwrites its own.
+            tag = f"{run_label}-" if run_label else ""
             base = (
                 f"hubspot/{org_id}/{object_name.lower()}/"
-                f"year={year}/month={month:02d}/part-{current or '0'}"
+                f"year={year}/month={month:02d}/part-{tag}{current or '0'}"
             )
             if use_pyarrow:
                 landed = _land_page_pyarrow(base, landable)
@@ -190,7 +229,7 @@ def run_hubspot_sync(
         paging = page.get("paging")
         next_after = paging["next"]["after"] if paging else None
         if on_page:
-            on_page(next_after, invalid, landed, len(landable))  # ClickHouse load from MinIO + checkpoint (idempotent if replayed)
+            on_page(next_after, invalid, landed, len(landable), page_max)  # ClickHouse load from MinIO + checkpoint (idempotent if replayed)
 
         progress["rows_yielded"] += len(results)
         progress["pages"] += 1
