@@ -4,6 +4,7 @@ time every object got the same flat 6-field schema (id, organisation_id,
 name, status, created_date, value) — this is the fix: each object has its
 own realistic fields, typed for ClickHouse column creation.
 """
+from app.shared_names import company_name
 import random
 import uuid
 from typing import Dict, List, Tuple
@@ -118,9 +119,15 @@ def generate_fake_records(
         record = {}
         for field_name, type_ in schema:
             if field_name == "id":
-                record[field_name] = str(uuid.uuid4())
+                # Stable ids, like real Salesforce: a re-run of the same job yields the same
+                # records, so ReplacingMergeTree replaces them instead of duplicating.
+                record[field_name] = f"{object_name.lower()}-{org_id}-{i}"
             elif field_name == "organisation_id":
                 record[field_name] = org_id
+            elif field_name == "account_id":  # reference one of the first 20 accounts
+                record[field_name] = f"accounts-{org_id}-{i % min(count, 20)}"
+            elif object_name == "Accounts" and field_name == "name":
+                record[field_name] = company_name(i)
             else:
                 record[field_name] = _fake_value(field_name, type_)
         if i in corrupt_indices:

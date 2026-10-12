@@ -51,6 +51,8 @@ class Settings:
     dlt_pipelines_dir: str = os.getenv("DLT_PIPELINES_DIR", "./.dlt_pipelines")
 
         # HubSpot real API (optional)
+    # Address ClickHouse uses to reach MinIO (inside Docker: http://minio:9000). Empty = http://MINIO_ENDPOINT.
+    clickhouse_s3_endpoint: str = os.getenv("CLICKHOUSE_S3_ENDPOINT", "")
     slack_mock_enabled: bool = os.getenv("SLACK_MOCK_ENABLED", "true").lower() == "true"
     slack_base_url: str = os.getenv("SLACK_BASE_URL", "https://slack.com")
     slack_bot_token: str = os.getenv("SLACK_BOT_TOKEN", "")

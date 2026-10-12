@@ -20,7 +20,9 @@ from app.models import Job, JobStatus, ChannelCheckpoint
 from app.config import mock_base_url, settings as app_settings
 from app.errors import ConfigurationError, InfrastructureUnavailable
 from app.retry import with_retry
+from app.clickhouse_sink import get_clickhouse_sink
 from app.slack.client import SlackClient
+from app.slack.tables import CHANNELS_RENAMES, SLACK_TABLES, USERS_RENAMES
 from mock_services.slack import MOCK_SLACK_TOKEN
 from app.storage import get_storage
 
@@ -84,204 +86,61 @@ def _write_parquet(path: str, rows: List[Dict]) -> None:
     storage.put_object(path, output.getvalue())
 
 
-def _load_clickhouse_rows(rows: List[Dict]) -> None:
-    """
-    Optional ClickHouse loader.
+# ── ClickHouse: always loaded from the landed files in MinIO ─────────────────────────
 
-    The ingestion still works when ClickHouse is disabled. When enabled, rows
-    are inserted into a ReplacingMergeTree table keyed by message_id.
-    """
-    from app.config import settings
+_KEYS = {
+    "bronze_slack_messages": ("message_id",),
+    "slack_users": ("user_id",),
+    "slack_channels": ("channel_id",),
+    "slack_files": ("file_id",),
+    "slack_reactions": ("message_id", "emoji", "user_id"),
+}
 
-    if not settings.clickhouse_enabled or not rows:
+
+def _ensure_slack_tables(sink) -> None:
+    if getattr(sink, "_slack_tables_ready", False):
         return
+    for table, spec in SLACK_TABLES.items():
+        sink.ensure_table(
+            table, spec["schema"], engine=spec["engine"], order_by=spec["order_by"], partition_by=spec["partition_by"]
+        )
+    sink.ensure_slack_views()  # a Slack-only deployment must get its own view
+    sink._slack_tables_ready = True
 
-    import clickhouse_connect
 
-    client = clickhouse_connect.get_client(
-        host=settings.clickhouse_host,
-        port=settings.clickhouse_port,
-        username=settings.clickhouse_user,
-        password=settings.clickhouse_password,
-        database=settings.clickhouse_database,
+def _load_into_clickhouse(table: str, paths: List[str], renames: Optional[Dict[str, str]] = None) -> None:
+    """ClickHouse reads each landed Parquet file from MinIO itself (s3() table function)."""
+    if not paths:
+        return
+    sink = get_clickhouse_sink()
+    _ensure_slack_tables(sink)
+    keys = _KEYS[table]
+    sink.load_from_storage(
+        table, SLACK_TABLES[table]["schema"], paths, renames=renames, required=keys, key_columns=keys
     )
 
-    # ── Main messages table ──
-    client.command(
-        """
-        CREATE TABLE IF NOT EXISTS bronze_slack_messages
-        (
-            message_id String,
-            channel_id String,
-            user_id String,
-            text String,
-            message_ts String,
-            thread_ts Nullable(String),
-            source String,
-            processing_date Date,
-            inserted_at DateTime
-        )
-        ENGINE = ReplacingMergeTree(inserted_at)
-        PARTITION BY processing_date
-        ORDER BY (channel_id, message_id)
-        """
-    )
 
-    # ── Users metadata table ──
-    client.command(
-        """
-        CREATE TABLE IF NOT EXISTS slack_users
-        (
-            user_id String,
-            name String,
-            real_name String,
-            profile_email Nullable(String),
-            is_bot Boolean
-        )
-        ENGINE = ReplacingMergeTree()
-        ORDER BY user_id
-        """
-    )
+def _file_rows(messages: Iterable[Dict]) -> List[Dict]:
+    rows = []
+    for m in messages:
+        for f in m.get("files") or []:
+            rows.append({
+                "file_id": str(f.get("id")), "message_id": str(m["id"]), "channel_id": str(m["channel_id"]),
+                "file_name": f.get("name") or "", "file_type": f.get("filetype") or "", "size": int(f.get("size") or 0),
+            })
+    return rows
 
-    # ── Channels metadata table ──
-    client.command(
-        """
-        CREATE TABLE IF NOT EXISTS slack_channels
-        (
-            channel_id String,
-            name String,
-            topic String,
-            is_private Boolean,
-            created Int64
-        )
-        ENGINE = ReplacingMergeTree()
-        ORDER BY channel_id
-        """
-    )
 
-    # ── Thread replies table ──
-    client.command(
-        """
-        CREATE TABLE IF NOT EXISTS slack_threads
-        (
-            thread_ts String,
-            channel_id String,
-            reply_count Int32,
-            latest_reply_ts String
-        )
-        ENGINE = ReplacingMergeTree()
-        ORDER BY (channel_id, thread_ts)
-        """
-    )
-
-    # ── File metadata table ──
-    client.command(
-        """
-        CREATE TABLE IF NOT EXISTS slack_files
-        (
-            file_id String,
-            message_id String,
-            channel_id String,
-            file_name String,
-            file_type String,
-            size Int64
-        )
-        ENGINE = ReplacingMergeTree()
-        ORDER BY (channel_id, file_id)
-        """
-    )
-
-    # ── Reactions table ──
-    client.command(
-        """
-        CREATE TABLE IF NOT EXISTS slack_reactions
-        (
-            message_id String,
-            channel_id String,
-            emoji String,
-            user_id String
-        )
-        ENGINE = ReplacingMergeTree()
-        ORDER BY (channel_id, message_id, emoji)
-        """
-    )
-
-    # ── THE COMPLIANCE TIMELINE VIEW — joins everything ──
-    client.command(
-        """
-        CREATE VIEW IF NOT EXISTS v_slack_compliance_timeline AS
-        SELECT
-            m.message_id,
-            m.channel_id,
-            c.name as channel_name,
-            m.user_id,
-            u.real_name as user_name,
-            u.profile_email,
-            m.text,
-            m.message_ts,
-            m.thread_ts,
-            arrayConcat(
-                groupArray(DISTINCT f.file_name),
-                []
-            ) as attached_files,
-            groupArray(DISTINCT r.emoji) as reactions,
-            m.source,
-            m.processing_date,
-            m.inserted_at
-        FROM bronze_slack_messages m
-        LEFT JOIN slack_channels c ON m.channel_id = c.channel_id
-        LEFT JOIN slack_users u ON m.user_id = u.user_id
-        LEFT JOIN slack_files f ON m.message_id = f.message_id
-        LEFT JOIN slack_reactions r ON m.message_id = r.message_id
-        WHERE m.message_id IN (
-            SELECT message_id FROM bronze_slack_messages
-            WHERE (message_id, inserted_at) IN (
-                SELECT message_id, MAX(inserted_at) FROM bronze_slack_messages
-                GROUP BY message_id
-            )
-        )
-        GROUP BY
-            m.message_id, m.channel_id, c.name, m.user_id, u.real_name, u.profile_email,
-            m.text, m.message_ts, m.thread_ts, m.source, m.processing_date, m.inserted_at
-        ORDER BY m.message_ts DESC
-        """
-    )
-
-    # Insert into main messages table
-    columns = [
-        "message_id",
-        "channel_id",
-        "user_id",
-        "text",
-        "message_ts",
-        "thread_ts",
-        "source",
-        "processing_date",
-        "inserted_at",
-    ]
-    values = []
-
-    for row in rows:
-        values.append(
-            [
-                row["id"],
-                row["channel_id"],
-                row["user_id"],
-                row["text"],
-                row["message_ts"],
-                row.get("thread_ts"),
-                row["source"],
-                row["processing_date"],
-                row["inserted_at"],
-            ]
-        )
-
-    if values:
-        client.insert(
-            "bronze_slack_messages",
-            values,
-            column_names=columns,
-        )
+def _reaction_rows(messages: Iterable[Dict]) -> List[Dict]:
+    rows = []
+    for m in messages:
+        for r in m.get("reactions") or []:
+            for user in r.get("users") or []:
+                rows.append({
+                    "message_id": str(m["id"]), "channel_id": str(m["channel_id"]),
+                    "emoji": r.get("name") or "", "user_id": str(user),
+                })
+    return rows
 
 
 def _normalize_rows(rows: Iterable[Dict], source: str) -> List[Dict]:
@@ -391,13 +250,25 @@ def _backfill_channel(
 
             response = _fetch_page(client, channel_id, cursor, page_size)
             rows = _normalize_rows(response["messages"], "historical")
+            label = _cursor_label(cursor)
+            msg_paths, file_paths, reaction_paths = [], [], []
             if rows:
-                _write_parquet(
-                    f"slack/historical/{org_id}/channel_id={channel_id}/"
-                    f"processing_date={partition_date}/part-{_cursor_label(cursor)}.parquet",
-                    rows,
-                )
-                _load_clickhouse_rows(rows)
+                path = (f"slack/historical/{org_id}/channel_id={channel_id}/"
+                        f"processing_date={partition_date}/part-{label}.parquet")
+                _write_parquet(path, rows)
+                msg_paths.append(path)
+            file_rows, reaction_rows = _file_rows(response["messages"]), _reaction_rows(response["messages"])
+            if file_rows:
+                path = f"slack/historical/{org_id}/files/channel_id={channel_id}/part-{label}.parquet"
+                _write_parquet(path, file_rows)
+                file_paths.append(path)
+            if reaction_rows:
+                path = f"slack/historical/{org_id}/reactions/channel_id={channel_id}/part-{label}.parquet"
+                _write_parquet(path, reaction_rows)
+                reaction_paths.append(path)
+            _load_into_clickhouse("bronze_slack_messages", msg_paths)
+            _load_into_clickhouse("slack_files", file_paths)
+            _load_into_clickhouse("slack_reactions", reaction_paths)
 
             ckpt = (
                 db.query(ChannelCheckpoint)
@@ -560,7 +431,7 @@ def ingest_realtime_event(
 
         duplicate = parquet_path in get_storage().list_objects(parquet_path)  # Slack redelivers on timeouts
         _write_parquet(parquet_path, rows)
-        _load_clickhouse_rows(rows)
+        _load_into_clickhouse("bronze_slack_messages", [parquet_path])
 
         if not duplicate:  # a redelivery overwrites the same file; never count it twice
             db.query(Job).filter(Job.id == job_id).update(
@@ -604,5 +475,8 @@ def seed_metadata(org_id: str, client) -> None:
     """Writes the workspace's users and channels as Parquet metadata files."""
     users = [{**user, "organisation_id": org_id} for user in _list_users(client)]
     channels = [{**channel, "organisation_id": org_id} for channel in _list_channels(client)]
-    _write_parquet(f"slack/metadata/{org_id}/users.parquet", users)
-    _write_parquet(f"slack/metadata/{org_id}/channels.parquet", channels)
+    users_path, channels_path = f"slack/metadata/{org_id}/users.parquet", f"slack/metadata/{org_id}/channels.parquet"
+    _write_parquet(users_path, users)
+    _write_parquet(channels_path, channels)
+    _load_into_clickhouse("slack_users", [users_path], renames=USERS_RENAMES)
+    _load_into_clickhouse("slack_channels", [channels_path], renames=CHANNELS_RENAMES)

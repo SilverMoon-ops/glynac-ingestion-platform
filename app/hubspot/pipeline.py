@@ -29,6 +29,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from app.hubspot.mock_server import MockHubSpotClient
+from app.hubspot.schemas import validate_records
 from app.retry import with_retry
 from app.storage import get_storage
 from app.config import settings
@@ -94,11 +95,13 @@ def _normalise(record: dict) -> dict:
     }
 
 
-def _land_page_pyarrow(base_path: str, rows: list[dict]) -> None:
-    _write_parquet(f"{base_path}.parquet", rows)
+def _land_page_pyarrow(base_path: str, rows: list[dict]) -> list[str]:
+    path = f"{base_path}.parquet"
+    _write_parquet(path, rows)
+    return [path]
 
 
-def _land_page_dlt(base_path: str, object_name: str, rows: list[dict]) -> None:
+def _land_page_dlt(base_path: str, object_name: str, rows: list[dict]) -> list[str]:
     """Run one dlt load for this page and store its Parquet under a deterministic name."""
     try:
         import dlt
@@ -123,9 +126,13 @@ def _land_page_dlt(base_path: str, object_name: str, rows: list[dict]) -> None:
             for f in names
             if f.endswith(".parquet")
         )
+        landed = []
         for i, local in enumerate(files):
+            path = f"{base_path}{'' if i == 0 else f'-{i}'}.parquet"
             with open(local, "rb") as fh:
-                storage.put_object(f"{base_path}{'' if i == 0 else f'-{i}'}.parquet", fh.read())
+                storage.put_object(path, fh.read())
+            landed.append(path)
+        return landed
 
 
 def run_hubspot_sync(
@@ -134,7 +141,7 @@ def run_hubspot_sync(
     job_id: str,
     client: MockHubSpotClient,
     start_after: Optional[str] = None,
-    on_page: Optional[Callable[[Optional[str], list], None]] = None,
+    on_page: Optional[Callable[[Optional[str], list, list, int], None]] = None,
     partition: Optional[tuple[int, int]] = None,
 ) -> dict:
     """
@@ -167,21 +174,23 @@ def run_hubspot_sync(
 
         page = _fetch_page_with_retry(client, object_name, current, org_id)
         results = page.get("results", [])
-        landable = [_normalise(r) for r in results if r.get("id")]
+        valid, invalid = validate_records(results)
+        landable = [_normalise(r) for r in valid]
+        landed: list[str] = []
         if landable:
             base = (
                 f"hubspot/{org_id}/{object_name.lower()}/"
                 f"year={year}/month={month:02d}/part-{current or '0'}"
             )
             if use_pyarrow:
-                _land_page_pyarrow(base, landable)
+                landed = _land_page_pyarrow(base, landable)
             else:
-                _land_page_dlt(base, object_name, landable)
+                landed = _land_page_dlt(base, object_name, landable)
 
         paging = page.get("paging")
         next_after = paging["next"]["after"] if paging else None
         if on_page:
-            on_page(next_after, results)  # ClickHouse load + checkpoint (idempotent if replayed)
+            on_page(next_after, invalid, landed, len(landable))  # ClickHouse load from MinIO + checkpoint (idempotent if replayed)
 
         progress["rows_yielded"] += len(results)
         progress["pages"] += 1

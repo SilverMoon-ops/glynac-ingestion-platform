@@ -161,3 +161,55 @@ def api_server(db_session, monkeypatch):
     monkeypatch.setattr(settings, "api_internal_url", url)
     yield url
     server.should_exit = True
+
+
+# ── Real ClickHouse (chdb) reading from a MinIO-compatible S3 server (moto) ───────────
+
+@pytest.fixture(scope="session")
+def _s3_server():
+    pytest.importorskip("moto", reason="pip install -r requirements-dev.txt for the real-ClickHouse tests")
+    from moto.server import ThreadedMotoServer
+
+    port = _free_port()
+    server = ThreadedMotoServer(port=port, verbose=False)
+    server.start()
+    yield f"127.0.0.1:{port}"
+    server.stop()
+
+
+@pytest.fixture
+def real_clickhouse(_s3_server, db_session, monkeypatch):
+    """Storage = S3 server, ClickHouse = real engine reading those files via s3()."""
+    pytest.importorskip("chdb", reason="pip install -r requirements-dev.txt for the real-ClickHouse tests")
+    import boto3
+    import chdb.session
+
+    import app.clickhouse_sink as sink_module
+    import app.storage as storage_module
+    from app.clickhouse_sink import RealClickHouseSink
+    from app.config import settings
+    from tests.clickhouse_harness import ChdbClient
+
+    bucket = f"glynac-{uuid.uuid4().hex[:8]}"  # fresh bucket per test
+    s3 = boto3.client("s3", endpoint_url=f"http://{_s3_server}", aws_access_key_id="minioadmin",
+                      aws_secret_access_key="minioadmin", region_name="us-east-1")
+    s3.create_bucket(Bucket=bucket)
+    monkeypatch.setattr(settings, "storage_backend", "minio")
+    monkeypatch.setattr(settings, "minio_endpoint", _s3_server)
+    monkeypatch.setattr(settings, "minio_access_key", "minioadmin")
+    monkeypatch.setattr(settings, "minio_secret_key", "minioadmin")
+    monkeypatch.setattr(settings, "minio_bucket", bucket)
+    monkeypatch.setattr(settings, "minio_secure", False)
+    monkeypatch.setattr(settings, "clickhouse_s3_endpoint", "")
+    storage_module._storage_instance = None
+
+    client = ChdbClient(chdb.session.Session())
+    client.reset()
+    sink_module._sink_instance = RealClickHouseSink(client=client)
+    yield client
+    client.reset()
+    sink_module._sink_instance = None
+    storage_module._storage_instance = None
+
+
+import uuid  # noqa: E402  (used by the fixture above)

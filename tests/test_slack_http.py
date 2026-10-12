@@ -53,7 +53,9 @@ def test_historical_over_http_pages_with_opaque_cursors_and_fetches_thread_repli
     assert calls.count("auth.test") == 1
     files = get_storage().list_objects("slack/")
     assert any(f.endswith("metadata/org1/users.parquet") for f in files)
-    assert len([f for f in files if "/historical/" in f]) == 12  # one deterministic file per page
+    assert len([f for f in files if "/historical/org1/channel_id=" in f]) == 12  # one message file per page
+    assert any("/historical/org1/files/" in f for f in files)  # files and reactions land as their own datasets
+    assert any("/historical/org1/reactions/" in f for f in files)
     done = db_session.query(ChannelCheckpoint).filter(ChannelCheckpoint.job_id == job.id).all()
     assert len(done) == 3 and all(c.completed for c in done)
 

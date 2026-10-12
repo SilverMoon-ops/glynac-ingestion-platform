@@ -8,6 +8,7 @@ exact same record ids — which is what lets us prove "resume without duplicates
 instead of just asserting it.
 """
 from datetime import datetime, timedelta, timezone
+from app.shared_names import company_name
 from typing import Dict, List, Tuple
 
 from faker import Faker
@@ -26,7 +27,7 @@ HUBSPOT_SCHEMAS: Dict[str, List[SchemaField]] = {
     "Deals": [
         ("id", "string"), ("organisation_id", "string"), ("deal_name", "string"),
         ("stage", "string"), ("amount", "float"), ("pipeline", "string"),
-        ("updated_at", "datetime"),
+        ("company_id", "string"), ("updated_at", "datetime"),
     ],
     "Companies": [
         ("id", "string"), ("organisation_id", "string"), ("name", "string"),
@@ -132,6 +133,12 @@ def generate_fake_page(
                 record[field_name] = f"{object_name.lower()}-{org_id}-{idx}"
             elif field_name == "organisation_id":
                 record[field_name] = org_id
+            elif field_name == "company_id":  # a deal belongs to one of the first 20 companies
+                record[field_name] = f"companies-{org_id}-{idx % 20}"
+            elif object_name == "Deals" and field_name == "pipeline":  # ...and sits in one of 3 pipelines
+                record[field_name] = f"pipelines-{org_id}-{idx % 3}"
+            elif object_name == "Companies" and field_name == "name":
+                record[field_name] = company_name(idx)
             else:
                 record[field_name] = _fake_field(object_name, field_name, type_, idx)
         records.append(record)

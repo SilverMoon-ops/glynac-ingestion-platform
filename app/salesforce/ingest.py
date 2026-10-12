@@ -162,7 +162,8 @@ def run_salesforce_ingestion(
         for bad_record, reason in invalid_records:
             send_to_dead_letter(db, job.id, bad_record, reason)
 
-        date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        # Fixed per job (not "today"), so a re-run after a restart overwrites the same file.
+        date_str = (job.created_at or datetime.now(timezone.utc)).strftime("%Y-%m-%d")
         path = f"salesforce/{object_name}/{org_id}/{date_str}/part-0001.json"
         get_storage().put_object(path, json.dumps(valid_records).encode())
         update_checkpoint(
@@ -174,7 +175,7 @@ def run_salesforce_ingestion(
             return
         sink = get_clickhouse_sink()
         sink.ensure_table(object_name, SALESFORCE_SCHEMAS[object_name], service="salesforce")
-        sink.insert_rows(object_name, valid_records, service="salesforce")
+        sink.load_from_storage(object_name, SALESFORCE_SCHEMAS[object_name], [path], service="salesforce")
         sink.ensure_view(object_name, service="salesforce")
         sink.ensure_analytical_views()
 

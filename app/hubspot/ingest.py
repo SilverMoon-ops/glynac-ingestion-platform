@@ -76,23 +76,23 @@ def run_hubspot_ingestion(
         created = job.created_at or datetime.now(timezone.utc)
         partition = (created.year, created.month)
 
-        def on_page(next_cursor, results):
-            """Runs after each page has landed. Load ClickHouse, then checkpoint."""
-            valid, invalid = validate_records(results)
+        def on_page(next_cursor, invalid, landed, valid_count):
+            """Runs after each page has landed in MinIO. Rejects go to the DLQ, ClickHouse reads
+            the landed file(s) from MinIO, then the checkpoint is saved."""
             for bad_record, reason in invalid:
                 send_to_dead_letter(db, job.id, bad_record, reason)
             state["dead"] += len(invalid)
-            if valid:
+            if landed:
                 if not state["table_ready"]:
                     sink.ensure_table(object_name, HUBSPOT_SCHEMAS[object_name], service="hubspot")
                     state["table_ready"] = True
-                sink.insert_rows(object_name, valid, service="hubspot")
+                sink.load_from_storage(object_name, HUBSPOT_SCHEMAS[object_name], landed, service="hubspot")
             # Cursor and row count are saved in ONE commit: a crash before it
             # replays this page without double counting.
             update_checkpoint(
                 db, job,
                 cursor=json.dumps({"resume_cursor": next_cursor, "completed": next_cursor is None}),
-                row_count_delta=len(valid),
+                row_count_delta=valid_count,
             )
             print(f"[CHECKPOINT] hubspot/{object_name} job={job.id[:8]} next_cursor={next_cursor} rows={job.row_count}")
 
