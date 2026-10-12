@@ -107,6 +107,7 @@ def mock_services(_mock_server, monkeypatch):
     httpx.post(f"{_mock_server}/salesforce/_admin/reset")
     httpx.post(f"{_mock_server}/hubspot/_admin/reset")
     httpx.post(f"{_mock_server}/hubspot/_admin/config", json={"latency_seconds": 0})
+    httpx.post(f"{_mock_server}/slack/_admin/reset")
 
     class Controls:
         url = _mock_server
@@ -114,6 +115,14 @@ def mock_services(_mock_server, monkeypatch):
         @staticmethod
         def salesforce(**config):
             httpx.post(f"{_mock_server}/salesforce/_admin/config", json=config).raise_for_status()
+
+        @staticmethod
+        def slack(**config):
+            httpx.post(f"{_mock_server}/slack/_admin/config", json=config).raise_for_status()
+
+        @staticmethod
+        def slack_requests() -> list[str]:
+            return httpx.get(f"{_mock_server}/slack/_admin/requests").json()["requests"]
 
         @staticmethod
         def hubspot(**config):
@@ -128,3 +137,27 @@ def mock_services(_mock_server, monkeypatch):
             return httpx.get(f"{_mock_server}/salesforce/_admin/requests").json()["requests"]
 
     return Controls
+
+
+@pytest.fixture
+def api_server(db_session, monkeypatch):
+    """The real API app on a real port, so the mock Slack server can deliver webhooks to it."""
+    import threading
+    import time as _time
+
+    import uvicorn
+
+    from app.config import settings
+    from app.main import app
+
+    port = _free_port()
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning", lifespan="off"))
+    threading.Thread(target=server.run, daemon=True).start()
+    for _ in range(100):
+        if server.started:
+            break
+        _time.sleep(0.05)
+    url = f"http://127.0.0.1:{port}"
+    monkeypatch.setattr(settings, "api_internal_url", url)
+    yield url
+    server.should_exit = True

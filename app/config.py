@@ -51,6 +51,13 @@ class Settings:
     dlt_pipelines_dir: str = os.getenv("DLT_PIPELINES_DIR", "./.dlt_pipelines")
 
         # HubSpot real API (optional)
+    slack_mock_enabled: bool = os.getenv("SLACK_MOCK_ENABLED", "true").lower() == "true"
+    slack_base_url: str = os.getenv("SLACK_BASE_URL", "https://slack.com")
+    slack_bot_token: str = os.getenv("SLACK_BOT_TOKEN", "")
+    slack_signing_secret: str = os.getenv("SLACK_SIGNING_SECRET", "")
+    # How the mock Slack server reaches this API to deliver Events API webhooks
+    # (in Docker this is http://api:8000; empty = derive from the incoming request).
+    api_internal_url: str = os.getenv("API_INTERNAL_URL", "")
     hubspot_base_url: str = os.getenv("HUBSPOT_BASE_URL", "https://api.hubapi.com")
     hubspot_api_key: str = os.getenv("HUBSPOT_API_KEY", "")
     hubspot_mock_enabled: bool = os.getenv("HUBSPOT_MOCK_ENABLED", "true").lower() == "true"

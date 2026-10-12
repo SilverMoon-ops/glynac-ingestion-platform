@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import threading
@@ -16,7 +17,11 @@ from app.control import CANCEL, PAUSE, claim_job, clear_control, get_control, se
 from app.database import SessionLocal
 from app.jobs import transition, update_checkpoint
 from app.models import Job, JobStatus, ChannelCheckpoint
-from app.slack.mock_api import fetch_history, mock_channels, mock_users
+from app.config import mock_base_url, settings as app_settings
+from app.errors import ConfigurationError, InfrastructureUnavailable
+from app.retry import with_retry
+from app.slack.client import SlackClient
+from mock_services.slack import MOCK_SLACK_TOKEN
 from app.storage import get_storage
 
 
@@ -312,116 +317,113 @@ def _normalize_rows(rows: Iterable[Dict], source: str) -> List[Dict]:
     return normalized
 
 
+def make_slack_client() -> SlackClient:
+    """
+    SLACK_MOCK_ENABLED=true -> the real Web API client pointed at the mock HTTP server.
+    otherwise               -> SLACK_BOT_TOKEN is REQUIRED; auth failures fail the job.
+    """
+    if app_settings.slack_mock_enabled:
+        base = mock_base_url()
+        host, port = base.split("//", 1)[1].split(":")[0], int(base.rsplit(":", 1)[1].split("/")[0])
+        from mock_services.embedded import port_in_use
+
+        if not port_in_use(host, port):
+            raise InfrastructureUnavailable(
+                f"Mock services are not reachable at {base}. Run `python -m mock_services` "
+                f"(or `docker compose up -d`), or set SLACK_MOCK_ENABLED=false with a real SLACK_BOT_TOKEN."
+            )
+        return SlackClient(f"{base}/slack", MOCK_SLACK_TOKEN)
+    if not app_settings.slack_bot_token:
+        raise ConfigurationError("SLACK_MOCK_ENABLED=false but SLACK_BOT_TOKEN is not set.")
+    return SlackClient(app_settings.slack_base_url, app_settings.slack_bot_token)
+
+
+@with_retry
+def _authenticate(client) -> None:
+    client.authenticate()
+
+
+@with_retry
+def _list_channels(client) -> List[Dict]:
+    return client.list_channels()
+
+
+@with_retry
+def _list_users(client) -> List[Dict]:
+    return client.list_users()
+
+
+@with_retry
+def _fetch_page(client, channel_id: str, cursor: Optional[str], page_size: int) -> Dict:
+    return client.fetch_history(channel_id, cursor, page_size)
+
+
+def _cursor_label(cursor: Optional[str]) -> str:
+    """Opaque Slack cursors are not filename-safe; a short hash keeps the part name deterministic."""
+    return "0" if not cursor else hashlib.sha1(cursor.encode()).hexdigest()[:12]
+
+
 def _backfill_channel(
     job_id: str,
     channel_id: str,
     org_id: str,
-    start_cursor: Optional[int],
+    start_cursor: Optional[str],
     page_size: int,
-    total_messages: int,
+    client,
+    partition_date: str,
 ) -> int:
     """
     Backfills one Slack channel from start_cursor to exhaustion (or until a
-    pause/cancel signal fires).  Returns the number of rows written.
+    pause/cancel request is seen). Returns the number of rows written.
 
-    Runs inside its own thread — each call opens its own DB session so
-    SQLite's check_same_thread constraint is not violated.
-    
-    ✅ Per-channel checkpoint: Saves and resumes from channel-specific cursor.
+    Each page is a unit of recovery: land one deterministically named Parquet file,
+    load ClickHouse, then save cursor + row count + completed flag in ONE commit.
+    A crash replays at most the page in flight, which overwrites the same file.
+    Runs in its own thread with its own DB session.
     """
     rows_written = 0
     cursor = start_cursor
     db = SessionLocal()
-
     try:
         while True:
-            if _cancel_requested(job_id):
+            if _cancel_requested(job_id) or _pause_requested(job_id):
                 break
 
-            if _pause_requested(job_id):
-                # Save checkpoint for THIS SPECIFIC CHANNEL
-                ckpt = (
-                    db.query(ChannelCheckpoint)
-                    .filter(
-                        ChannelCheckpoint.job_id == job_id,
-                        ChannelCheckpoint.channel_id == channel_id,
-                    )
-                    .first()
-                )
-                if ckpt is None:
-                    ckpt = ChannelCheckpoint(
-                        job_id=job_id,
-                        channel_id=channel_id,
-                        cursor=cursor,
-                        message_ts=None,
-                        mode="historical",
-                    )
-                else:
-                    ckpt.cursor = cursor
-                    ckpt.message_ts = None
-                db.add(ckpt)
-                db.commit()
-                break
-
-            response = fetch_history(
-                channel_id=channel_id,
-                cursor=cursor,
-                page_size=page_size,
-                total_messages=total_messages,
-            )
-
+            response = _fetch_page(client, channel_id, cursor, page_size)
             rows = _normalize_rows(response["messages"], "historical")
+            if rows:
+                _write_parquet(
+                    f"slack/historical/{org_id}/channel_id={channel_id}/"
+                    f"processing_date={partition_date}/part-{_cursor_label(cursor)}.parquet",
+                    rows,
+                )
+                _load_clickhouse_rows(rows)
 
-            parquet_path = (
-                f"slack/historical/{org_id}/"
-                f"channel_id={channel_id}/"
-                f"processing_date={_utc_date()}/"
-                f"part-{cursor or 0}.parquet"
-            )
-
-            _write_parquet(parquet_path, rows)
-            _load_clickhouse_rows(rows)
-
-            # Checkpoint after every page — save cursor for THIS channel
             ckpt = (
                 db.query(ChannelCheckpoint)
-                .filter(
-                    ChannelCheckpoint.job_id == job_id,
-                    ChannelCheckpoint.channel_id == channel_id,
-                )
+                .filter(ChannelCheckpoint.job_id == job_id, ChannelCheckpoint.channel_id == channel_id)
                 .first()
             )
             if ckpt is None:
-                ckpt = ChannelCheckpoint(
-                    job_id=job_id,
-                    channel_id=channel_id,
-                    cursor=response["next_cursor"],
-                    message_ts=rows[-1]["message_ts"] if rows else None,
-                    mode="historical",
-                )
-            else:
-                ckpt.cursor = response["next_cursor"]
-                ckpt.message_ts = rows[-1]["message_ts"] if rows else None
+                ckpt = ChannelCheckpoint(job_id=job_id, channel_id=channel_id, mode="historical")
+            ckpt.cursor = response["next_cursor"]
+            ckpt.completed = not response["has_more"]
+            ckpt.message_ts = rows[-1]["message_ts"] if rows else ckpt.message_ts
             db.add(ckpt)
-
-            # Also update main job row count
-            job = db.query(Job).filter(Job.id == job_id).first()
-            if job is not None:
-                job.row_count += len(rows)
-                db.add(job)
-
+            # Atomic in SQL: several channel threads add to the same job row at once, and
+            # an ORM read-modify-write here silently loses updates.
+            db.query(Job).filter(Job.id == job_id).update(
+                {Job.row_count: Job.row_count + len(rows)}, synchronize_session=False
+            )
             db.commit()
+            print(f"[CHECKPOINT] slack/{channel_id} job={job_id[:8]} next_cursor={response['next_cursor']} rows+={len(rows)}")
 
             rows_written += len(rows)
-
             if not response["has_more"]:
                 break
-
             cursor = response["next_cursor"]
-
     finally:
         db.close()
-
     return rows_written
 
 
@@ -429,109 +431,103 @@ def run_historical_backfill(
     job_id: str,
     org_id: str,
     page_size: int = 10,
-    total_messages: int = 50,
+    client=None,
 ) -> None:
     """
-    Parallel Slack historical backfill.
-
-    Each channel is processed by its own thread via ThreadPoolExecutor.
-    Per-channel checkpoints ensure crash recovery works independently for each channel.
+    Parallel Slack historical backfill: one worker thread per channel, per-channel
+    checkpoints, so crash recovery and resume work independently for each channel.
     """
     db = SessionLocal()
-
     try:
         job = db.query(Job).filter(Job.id == job_id).first()
-
         if job is None:
             return
-
         if job.status == JobStatus.PENDING.value:
             job = transition(db, job, JobStatus.RUNNING)
         claim_job(job_id)
+        created = job.created_at or datetime.now(timezone.utc)
+        partition_date = created.strftime("%Y-%m-%d")  # fixed per job so a resume lands on the same paths
 
-        channels = mock_channels()
+        client = client or make_slack_client()
+        _authenticate(client)
+        channels = _list_channels(client)
+        seed_metadata(org_id, client)
 
-        # Build per-channel work items
         work_items = []
         for channel in channels:
-            cid = channel["id"]
-            
-            # Try to resume from saved checkpoint
             ckpt = (
                 db.query(ChannelCheckpoint)
-                .filter(
-                    ChannelCheckpoint.job_id == job_id,
-                    ChannelCheckpoint.channel_id == cid,
-                )
+                .filter(ChannelCheckpoint.job_id == job_id, ChannelCheckpoint.channel_id == channel["id"])
                 .first()
             )
-            
-            start = ckpt.cursor if ckpt else None
-            work_items.append((cid, start))
+            if ckpt is not None and ckpt.completed:
+                continue  # already fully backfilled before a pause/crash
+            work_items.append((channel["id"], ckpt.cursor if ckpt else None))
 
         db.close()
         db = None  # hand off to worker threads
 
-        # ── Parallel execution ──────────────────────────────────────────────
-        print(f"[CHECKPOINT] Slack historical backfill starting {len(work_items)} parallel channel workers")
+        failures: Dict[str, str] = {}
+        if work_items:
+            print(f"[CHECKPOINT] Slack historical backfill starting {len(work_items)} parallel channel workers")
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=len(work_items), thread_name_prefix="slack-channel"
+            ) as executor:
+                futures = {
+                    executor.submit(
+                        _backfill_channel, job_id, cid, org_id, start, page_size, client, partition_date
+                    ): cid
+                    for cid, start in work_items
+                }
+                for future in concurrent.futures.as_completed(futures):
+                    cid = futures[future]
+                    try:
+                        print(f"[CHECKPOINT] Channel {cid} finished: {future.result()} rows written")
+                    except Exception as exc:  # one channel failing must not hide behind COMPLETED
+                        failures[cid] = str(exc)
+                        print(f"[CHECKPOINT] Channel {cid} FAILED: {exc}")
 
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=len(work_items), thread_name_prefix="slack-channel"
-        ) as executor:
-            futures = {
-                executor.submit(
-                    _backfill_channel,
-                    job_id, channel_id, org_id, start_cur, page_size, total_messages,
-                ): channel_id
-                for channel_id, start_cur in work_items
-            }
-
-            for future in concurrent.futures.as_completed(futures):
-                channel_id = futures[future]
-                try:
-                    rows = future.result()
-                    print(f"[CHECKPOINT] Channel {channel_id} finished — {rows} rows written")
-                except Exception as exc:
-                    print(f"[CHECKPOINT] Channel {channel_id} worker error: {exc}")
-
-        # Re-open a session to finalize job status
         db = SessionLocal()
         job = db.query(Job).filter(Job.id == job_id).first()
-
         if job is None:
             return
-
         if _cancel_requested(job_id):
             transition(db, job, JobStatus.CANCELLED)
         elif _pause_requested(job_id):
             if job.status != JobStatus.PAUSED.value:
                 transition(db, job, JobStatus.PAUSED)
+        elif failures:
+            detail = "; ".join(f"{cid}: {msg}" for cid, msg in sorted(failures.items()))
+            transition(db, job, JobStatus.FAILED, detail=f"{len(failures)} channel(s) failed: {detail}")
         else:
-            transition(db, job, JobStatus.COMPLETED)
+            transition(db, job, JobStatus.COMPLETED, detail=f"{job.row_count} messages from {len(channels)} channels")
 
     except Exception as exc:
         if db:
             db.rollback()
-
         _db = SessionLocal()
         try:
             job = _db.query(Job).filter(Job.id == job_id).first()
             if job is not None:
-                job.error = str(exc)
-                _db.add(job)
-                _db.commit()
                 try:
                     transition(_db, job, JobStatus.FAILED, detail=str(exc))
                 except Exception:
                     pass
         finally:
             _db.close()
-
     finally:
         if db:
             db.close()
         _pause_events.pop(job_id, None)
         _cancel_events.pop(job_id, None)
+
+
+def _message_date(message_ts: str) -> str:
+    """Partition by the message's own date, so a redelivery on another day lands on the same path."""
+    try:
+        return datetime.fromtimestamp(float(message_ts), timezone.utc).strftime("%Y-%m-%d")
+    except (TypeError, ValueError):
+        return _utc_date()
 
 
 def ingest_realtime_event(
@@ -558,22 +554,23 @@ def ingest_realtime_event(
         parquet_path = (
             f"slack/realtime/{org_id}/"
             f"channel_id={row['channel_id']}/"
-            f"processing_date={_utc_date()}/"
+            f"processing_date={_message_date(row['message_ts'])}/"
             f"{row['message_id'].replace(':', '_')}.parquet"
         )
 
+        duplicate = parquet_path in get_storage().list_objects(parquet_path)  # Slack redelivers on timeouts
         _write_parquet(parquet_path, rows)
         _load_clickhouse_rows(rows)
 
-        job = db.query(Job).filter(Job.id == job_id).first()
-
-        if job is not None:
-            job.row_count += 1
-            db.add(job)
+        if not duplicate:  # a redelivery overwrites the same file; never count it twice
+            db.query(Job).filter(Job.id == job_id).update(
+                {Job.row_count: Job.row_count + 1}, synchronize_session=False
+            )
             db.commit()
 
         return {
             "status": "ingested",
+            "duplicate": duplicate,
             "message_id": row["message_id"],
             "path": parquet_path,
         }
@@ -603,32 +600,9 @@ def create_realtime_job(job_id: str) -> None:
         db.close()
 
 
-def seed_metadata(org_id: str) -> None:
-    """
-    Writes mock users and channels as Parquet metadata files.
-    """
-    users = [
-        {
-            **user,
-            "organisation_id": org_id,
-        }
-        for user in mock_users()
-    ]
-
-    channels = [
-        {
-            **channel,
-            "organisation_id": org_id,
-        }
-        for channel in mock_channels()
-    ]
-
-    _write_parquet(
-        f"slack/metadata/{org_id}/users.parquet",
-        users,
-    )
-
-    _write_parquet(
-        f"slack/metadata/{org_id}/channels.parquet",
-        channels,
-    )
+def seed_metadata(org_id: str, client) -> None:
+    """Writes the workspace's users and channels as Parquet metadata files."""
+    users = [{**user, "organisation_id": org_id} for user in _list_users(client)]
+    channels = [{**channel, "organisation_id": org_id} for channel in _list_channels(client)]
+    _write_parquet(f"slack/metadata/{org_id}/users.parquet", users)
+    _write_parquet(f"slack/metadata/{org_id}/channels.parquet", channels)

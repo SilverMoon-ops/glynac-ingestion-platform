@@ -25,6 +25,8 @@ services:
       SALESFORCE_MOCK_ENABLED: "true"
       MOCK_SERVICES_URL: http://mock-services:9000
       HUBSPOT_MOCK_ENABLED: "true"
+      SLACK_MOCK_ENABLED: "true"
+      API_INTERNAL_URL: http://api:8000   # where the mock Slack delivers Events API webhooks
     volumes:
       - ./data:/app/data
       - ./.dlt_pipelines:/app/.dlt_pipelines

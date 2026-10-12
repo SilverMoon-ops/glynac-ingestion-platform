@@ -12,7 +12,7 @@ from app.slack.engine import ingest_realtime_event, run_historical_backfill
 from app.storage import get_storage
 
 
-def test_historical_backfill_writes_parquet(db_session):
+def test_historical_backfill_writes_parquet(db_session, mock_services):
     job = create_job(
         db_session,
         service="slack",
@@ -20,11 +20,11 @@ def test_historical_backfill_writes_parquet(db_session):
         org_id="test-org",
     )
 
+    mock_services.slack(messages_per_channel=10)
     run_historical_backfill(
         job_id=job.id,
         org_id="test-org",
         page_size=5,
-        total_messages=10,
     )
 
     storage = get_storage()

@@ -124,9 +124,9 @@ const actions={
   "sf-all":()=>run("sfMsg",async()=>{const os=[...$("sfObj").options].map(o=>o.value);await Promise.all(os.map(o=>post("/api/salesforce/start",{object_name:o,org_id:ORG()})));return "Started "+os.length+" jobs"}),
   "hs-start":()=>run("hsMsg",async()=>{const j=await post("/api/hubspot/start",{object_name:$("hsObj").value,org_id:ORG()});return "Started "+j.id.slice(0,8)}),
   "hs-all":()=>run("hsMsg",async()=>{const r=await post("/api/hubspot/start_all",{org_id:ORG()});return r.message}),
-  "sl-hist":()=>run("slMsg",async()=>{const j=await post("/api/slack/historical/start",{org_id:ORG(),page_size:10,total_messages:50});return "Backfill "+j.id.slice(0,8)}),
+  "sl-hist":()=>run("slMsg",async()=>{const j=await post("/api/slack/historical/start",{org_id:ORG(),page_size:10});return "Backfill "+j.id.slice(0,8)}),
   "sl-live":()=>run("slMsg",async()=>{const j=await post("/api/slack/realtime/start",{org_id:ORG()});return "Realtime worker "+j.id.slice(0,8)}),
-  "sl-event":()=>run("slMsg",async()=>{await post("/api/slack/realtime/event",{channel_id:"C001",user_id:"U001",text:"Test compliance message",message_ts:(Date.now()/1000).toFixed(6),event_id:"evt-"+Date.now()});return "Event ingested"}),
+  "sl-event":()=>run("slMsg",async()=>{const r=await post("/api/slack/realtime/simulate",{channel_id:"C001",user_id:"U001",text:"Test compliance message"});return "Slack webhook delivered: HTTP "+r.status_code+" "+(r.response.status||"")}),
   refresh,close:()=>$("dlg").close(),
   files:async()=>{const s=$("fsvc").value;try{const r=await api(`/api/${s}/files`);$("files").textContent=r.files.length?r.files.join("\n"):"No files landed yet."}catch(e){$("files").textContent=e.message}},
 };

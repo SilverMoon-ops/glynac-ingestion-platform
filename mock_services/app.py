@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 
-from mock_services import hubspot, salesforce
+from mock_services import hubspot, salesforce, slack
 
 
 def create_app() -> FastAPI:
@@ -8,9 +8,10 @@ def create_app() -> FastAPI:
     app = FastAPI(title="Glynac mock services")
     app.mount("/salesforce", salesforce.create_app())
     app.mount("/hubspot", hubspot.create_app())
+    app.mount("/slack", slack.create_app())
 
     @app.get("/health")
     def health():
-        return {"status": "ok", "services": ["salesforce", "hubspot"]}
+        return {"status": "ok", "services": ["salesforce", "hubspot", "slack"]}
 
     return app

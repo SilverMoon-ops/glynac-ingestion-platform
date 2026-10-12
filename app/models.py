@@ -2,7 +2,7 @@ import enum
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import Column, String, Integer, Text, DateTime, ForeignKey, UniqueConstraint
+from sqlalchemy import Boolean, Column, String, Integer, Text, DateTime, ForeignKey, UniqueConstraint
 from sqlalchemy.orm import relationship
 
 from app.database import Base
@@ -93,7 +93,8 @@ class ChannelCheckpoint(Base):
     id = Column(String, primary_key=True, default=_uuid)
     job_id = Column(String, ForeignKey("jobs.id"), nullable=False, index=True)
     channel_id = Column(String, nullable=False, index=True)
-    cursor = Column(Integer, nullable=True)  # pagination cursor
+    cursor = Column(String, nullable=True)  # opaque pagination cursor (Slack cursors are strings)
+    completed = Column(Boolean, nullable=False, default=False)  # channel fully backfilled
     message_ts = Column(String, nullable=True)  # high-water mark (last message timestamp)
     mode = Column(String, nullable=False)  # "historical" or "realtime"
     created_at = Column(DateTime, default=_now)

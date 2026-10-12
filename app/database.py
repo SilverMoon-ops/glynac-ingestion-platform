@@ -40,8 +40,14 @@ def _ensure_columns():
     """create_all never alters existing tables; add columns introduced later."""
     from sqlalchemy import inspect, text
 
-    existing = {c["name"] for c in inspect(engine).get_columns("jobs")}
+    wanted = {
+        "jobs": {"control": "VARCHAR", "owner": "VARCHAR"},
+        "channel_checkpoint": {"completed": "BOOLEAN NOT NULL DEFAULT 0"},
+    }
+    inspector = inspect(engine)
     with engine.begin() as conn:
-        for col in ("control", "owner"):
-            if col not in existing:
-                conn.execute(text(f"ALTER TABLE jobs ADD COLUMN {col} VARCHAR"))
+        for table, columns in wanted.items():
+            existing = {c["name"] for c in inspector.get_columns(table)}
+            for name, ddl in columns.items():
+                if name not in existing:
+                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"))

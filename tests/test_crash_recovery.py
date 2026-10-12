@@ -69,23 +69,25 @@ def test_hubspot_crash_recovery_zero_duplicates(db_session):
     assert len(set(ids)) == 20
 
 
-def test_slack_channel_independent_checkpoint_recovery(db_session):
+def test_slack_channel_independent_checkpoint_recovery(db_session, mock_services):
     """
     Slack: Two channels paused independently, each resumes from own cursor.
     """
-    from app.slack.engine import _backfill_channel, request_pause
+    from app.slack.engine import _backfill_channel, make_slack_client
     import concurrent.futures
     
     job = create_job(db_session, service="slack", object_name="historical", org_id="org1")
     
+    mock_services.slack(messages_per_channel=20)
+    client = make_slack_client()
     # Process two channels in parallel
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
         futures = [
             executor.submit(
-                _backfill_channel, job.id, "C001", "org1", None, 5, 20
+                _backfill_channel, job.id, "C001", "org1", None, 5, client, "2026-01-01"
             ),
             executor.submit(
-                _backfill_channel, job.id, "C002", "org1", None, 5, 20
+                _backfill_channel, job.id, "C002", "org1", None, 5, client, "2026-01-01"
             ),
         ]
         concurrent.futures.wait(futures)

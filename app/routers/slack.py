@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from typing import Dict, List
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, WebSocket
+import requests
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -18,7 +19,6 @@ from app.slack.engine import (
     request_cancel,
     request_pause,
     run_historical_backfill,
-    seed_metadata,
 )
 from app.clickhouse_sink import get_clickhouse_sink
 from app.storage import get_storage
@@ -33,7 +33,6 @@ router = APIRouter(
 class HistoricalStartRequest(BaseModel):
     org_id: str = "org1"
     page_size: int = 10
-    total_messages: int = 50
 
 
 class RealtimeStartRequest(BaseModel):
@@ -72,14 +71,11 @@ def start_historical(
         org_id=payload.org_id,
     )
 
-    seed_metadata(payload.org_id)
-
     background_tasks.add_task(
         run_historical_backfill,
         job.id,
         payload.org_id,
         payload.page_size,
-        payload.total_messages,
     )
 
     return job
@@ -146,10 +142,10 @@ def resume_slack_job(
 ):
     job = get_job_or_404(db, job_id)
 
-    if job.status != JobStatus.PAUSED.value:
+    if job.status not in (JobStatus.PAUSED.value, JobStatus.FAILED.value):
         raise HTTPException(
             status_code=409,
-            detail=f"Only PAUSED jobs can be resumed. Current status: {job.status}",
+            detail=f"Only PAUSED or FAILED jobs can be resumed. Current status: {job.status}",
         )
 
     clear_control_events(job_id)
@@ -259,37 +255,28 @@ def receive_realtime_event(
     )
 
 
-@router.websocket("/ws/{job_id}")
-async def slack_websocket(websocket: WebSocket, job_id: str):
+class SimulateRequest(BaseModel):
+    channel_id: str = "C001"
+    user_id: str = "U001"
+    text: str = "Live message"
+
+
+@router.post("/realtime/simulate")
+def simulate_realtime_message(payload: SimulateRequest, request: Request):
     """
-    Demo WebSocket Events API endpoint.
-
-    Send JSON like:
-
-    {
-      "channel_id": "C001",
-      "user_id": "U001",
-      "text": "Live compliance message",
-      "message_ts": "1700009999.000000"
-    }
-
-    For production, authenticate the WebSocket handshake using a signed
-    token or an OAuth-authenticated Slack Events API gateway.
+    Demo helper: ask the mock Slack server to deliver a signed Events API webhook to
+    /api/slack/events, exactly the way Slack would. Only available with the mock.
     """
-    await websocket.accept()
+    from app.config import mock_base_url, settings
 
-    while True:
-        event = await websocket.receive_json()
-
-        event["id"] = event.get(
-            "event_id",
-            f"{event['channel_id']}:{event['message_ts']}",
-        )
-
-        result = ingest_realtime_event(
-            job_id=job_id,
-            event=event,
-            org_id="org1",
-        )
-
-        await websocket.send_json(result)
+    if not settings.slack_mock_enabled:
+        raise HTTPException(status_code=400, detail="Only available with SLACK_MOCK_ENABLED=true.")
+    own_url = (settings.api_internal_url or str(request.base_url)).rstrip("/")
+    resp = requests.post(
+        f"{mock_base_url()}/slack/_admin/emit",
+        json={"target_url": f"{own_url}/api/slack/events", "channel": payload.channel_id,
+              "user": payload.user_id, "text": payload.text},
+        timeout=15,
+    )
+    resp.raise_for_status()
+    return resp.json()

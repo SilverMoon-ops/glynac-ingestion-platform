@@ -89,12 +89,15 @@ def test_hubspot_parallel_execution(db_session):
     assert len(parquet_files) >= 3, f"Expected at least 3 Parquet files, got {len(parquet_files)}"
 
 
-def test_slack_per_channel_checkpoint_recovery(db_session):
+def test_slack_per_channel_checkpoint_recovery(db_session, mock_services):
     """
     Task 3: Each channel has independent checkpoint; crash recovery works per-channel.
     """
     job = create_job(db_session, service="slack", object_name="historical", org_id="org1")
     
+    mock_services.slack(messages_per_channel=10)
+    from app.slack.engine import make_slack_client
+    client = make_slack_client()
     # Simulate processing one channel at a time
     channels = ["C001", "C002"]
     for channel_id in channels:
@@ -104,7 +107,8 @@ def test_slack_per_channel_checkpoint_recovery(db_session):
             org_id="org1",
             start_cursor=None,
             page_size=5,
-            total_messages=10,
+            client=client,
+            partition_date="2026-01-01",
         )
         assert rows > 0
     
@@ -153,7 +157,7 @@ def test_slack_realtime_event_idempotent(db_session):
     assert res1["path"] == res2["path"]
 
 
-def test_slack_compliance_timeline_view_with_joins(db_session):
+def test_slack_compliance_timeline_view_with_joins(db_session, mock_services):
     """
     Task 3: Compliance timeline view joins users, channels, files, reactions.
     
@@ -162,12 +166,12 @@ def test_slack_compliance_timeline_view_with_joins(db_session):
     """
     job = create_job(db_session, service="slack", object_name="historical", org_id="org1")
     
+    mock_services.slack(messages_per_channel=30)
     # Ingest some messages
     run_historical_backfill(
         job_id=job.id,
         org_id="org1",
         page_size=10,
-        total_messages=30,
     )
     
     # Verify job completed successfully
