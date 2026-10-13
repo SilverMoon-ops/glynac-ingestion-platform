@@ -84,10 +84,31 @@ proc, c = boot()
 c.post("/api/hubspot/start_all", json={"org_id": "org1"}).raise_for_status()
 slack = c.post("/api/slack/historical/start", json={"org_id": "org1", "page_size": SLACK_PAGE}).json()
 
+# Real-time stream: 2 events ingested live, then pause, then 3 events that must be buffered (not lost).
+rt = c.post("/api/slack/realtime/start", json={"org_id": "org1"}).json()
+for _ in range(50):
+    if next(j for j in jobs(c) if j["id"] == rt["id"])["status"] == "RUNNING":
+        break
+    time.sleep(0.1)
+
+
+def send_event(text):
+    return c.post("/api/slack/realtime/simulate", json={"text": text}).json()["response"]["status"]
+
+
+live = [send_event(f"live {i}") for i in range(2)]
+for _ in range(100):
+    if next(j for j in jobs(c) if j["id"] == rt["id"])["row_count"] >= 2:
+        break
+    time.sleep(0.1)
+c.post(f"/api/slack/pause/{rt['id']}").raise_for_status()
+buffered = [send_event(f"while paused {i}") for i in range(3)]
+print(f"real-time: live events -> {live}; stream paused; events while paused -> {buffered}")
+
 for _ in range(200):  # wait until work is mid-flight: some rows checkpointed, none finished
     js = jobs(c)
     hs = [j for j in js if j["service"] == "hubspot"]
-    sl = [j for j in js if j["service"] == "slack"]
+    sl = [j for j in js if j["service"] == "slack" and j["object_name"] == "historical"]
     if hs and all(j["row_count"] >= 20 for j in hs) and sl and sl[0]["row_count"] >= 30 and sl[0]["status"] == "RUNNING":
         break
     time.sleep(0.2)
@@ -118,7 +139,7 @@ check(all(j["row_count"] == HUBSPOT_RECORDS for j in hs), f"every HubSpot job ha
 pages = -(-HUBSPOT_RECORDS // HUBSPOT_PAGE)
 counts = {d.split("/")[-1]: len(glob.glob(f"{d}/year=*/month=*/*.parquet")) for d in glob.glob(f"{work}/objects/hubspot/org1/*")}
 check(len(counts) == 8 and all(n == pages for n in counts.values()), f"exactly {pages} Parquet files per HubSpot resource (no duplicates)")
-sl = next(j for j in js if j["service"] == "slack")
+sl = next(j for j in js if j["service"] == "slack" and j["object_name"] == "historical")
 replies = len(range(0, SLACK_PER_CHANNEL - 1, 3))
 expected = 3 * (SLACK_PER_CHANNEL + replies)
 check(sl["status"] == "COMPLETED", "Slack backfill COMPLETED after the crash")
@@ -128,6 +149,24 @@ check(len(slack_files) == len(set(slack_files)) == 3 * (SLACK_PER_CHANNEL // SLA
 audit = [a["event"] for j in js for a in c.get(f"/api/jobs/{j['id']}/audit").json()]
 recovered = audit.count("RECOVERY")
 check(recovered >= 8, f"RECOVERY audit entries written for the resumed jobs ({recovered} found)")
+
+# ── Real-time: the pause and the buffer survived the kill; resume drains it ──────────
+rtj = next(j for j in js if j["object_name"] == "realtime")
+backlog = c.get("/api/slack/realtime/backlog", params={"org_id": "org1"}).json()
+check(live == ["accepted"] * 2 and buffered == ["buffered"] * 3, "live events accepted; events during the pause answered 200 and buffered")
+check(rtj["status"] == "PAUSED" and rtj["row_count"] == 2, "real-time job is still PAUSED after the crash, with its 2 live rows (not auto-resumed)")
+check(backlog["buffered"] == 3, f"the 3 events buffered during the pause survived kill -9 (in the database); backlog={backlog}")
+c.post(f"/api/slack/resume/{rtj['id']}").raise_for_status()
+for _ in range(100):
+    now = next(j for j in jobs(c) if j["id"] == rtj["id"])
+    if now["row_count"] >= 5:
+        break
+    time.sleep(0.2)
+backlog = c.get("/api/slack/realtime/backlog", params={"org_id": "org1"}).json()
+check(now["status"] == "RUNNING" and now["row_count"] == 5, "after Resume the stream has all 5 messages (2 live + 3 buffered): none lost")
+check(backlog["buffered"] == 0, "the buffer is empty after the drain")
+rt_files = glob.glob(f"{work}/objects/slack/realtime/org1/channel_id=*/*/*.parquet")
+check(len(rt_files) == len(set(rt_files)) == 5, "5 unique real-time message files in storage")
 
 proc.terminate()
 print("\nRESULT:", "ALL CHECKS PASSED" if not failures else f"{len(failures)} CHECK(S) FAILED")

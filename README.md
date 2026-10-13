@@ -171,7 +171,13 @@ The state store is our own table (`app/sync_state.py`), not dlt's internal state
 ### BE-3 Slack, two modes
 
 * **Historical backfill:** one worker thread per channel, each with its own cursor checkpoint (`channel_checkpoint` table). Pulls channels, users, messages, thread replies (`conversations.replies`), file metadata and reactions. Files and reactions land as their own Parquet datasets.
-* **Real-time:** Slack POSTs signed events to `/api/slack/events`. The endpoint verifies the signature and timestamp, answers the `url_verification` challenge, ignores bot messages and edits, acknowledges immediately, and ingests in the background. Delivery is at-least-once, so ingestion is idempotent (a message id is `channel:ts`; a redelivery overwrites the same file and is not counted twice).
+* **Real-time:** Slack POSTs signed events to `/api/slack/events`. The endpoint verifies the signature and timestamp, answers the `url_verification` challenge, ignores bot messages and edits, acknowledges immediately, and ingests in the background. Delivery is at-least-once, so ingestion is idempotent: a message id is `channel:ts`, a redelivery overwrites the same file, and a database record committed together with the row count guarantees it is **counted exactly once**.
+
+  **Pause, resume and no lost messages.** Slack has already received its `200 OK` by the time an event is processed, so an event that cannot be ingested right now must be kept:
+  * **Pause is immediate** (a real-time job has no worker loop to wait on). While `PAUSED` (or `FAILED`, or not yet started), incoming events are **buffered in the database** (`realtime_backlog`), not dropped. Slack redeliveries of a buffered event do not pile up.
+  * **A failed ingest is buffered too** (ClickHouse or MinIO briefly down): the event is kept and retried, not lost.
+  * **Resume, start and crash recovery** bring the stream up to date: drain the buffer oldest-first (a row is deleted only after it was ingested), then **catch up from each channel's high-water mark** (`realtime_mark`: the newest `message_ts` ingested) by reading the channel history after it. That fills gaps from downtime or from webhooks Slack gave up on. If the drain or catch-up fails, the job goes `FAILED` with the reason and Resume retries it.
+  * A cancelled stream ignores events. `GET /api/slack/realtime/backlog` shows what is buffered and the marks.
 
 ---
 
@@ -188,7 +194,7 @@ The state store is our own table (`app/sync_state.py`), not dlt's internal state
 | **Retries** | Exponential backoff with jitter (up to 5 attempts) for **transient** failures only: HTTP 429, 5xx, dropped connections. Bad credentials and 4xx errors fail fast with a clear message. |
 | **Dead letters** | Records without an id/organisation are stored in `dead_letters` with the reason instead of being lost or crashing the batch. |
 | **Audit** | Every state change and checkpoint is written to `audit_log` and shown per job. |
-| **Atomic counting** | Row counts are updated with SQL `row_count = row_count + n`, so parallel channel workers cannot lose updates. |
+| **Atomic counting and marks** | Row counts use SQL `row_count = row_count + n`. High-water marks (Slack real-time, HubSpot incremental) move forward in a single atomic SQL statement, so concurrent threads can neither fail on the first insert nor write an older value over a newer one. Local-storage writes are atomic (temp file + rename), like an S3 PUT. |
 | **Failure visibility** | One failing Slack channel fails the job and names the channel; Resume re-reads only that channel. |
 
 The single-process assumption: recovery treats any job not owned by the current process as orphaned, so run **one API instance** with the SQLite store.
@@ -252,7 +258,7 @@ All `/api/*` routes below require a console session or an HMAC signature, except
 | Jobs | `GET /api/jobs`, `/api/jobs/stats`, `/api/jobs/{id}`, `/{id}/audit`, `/{id}/dead_letters`; `POST /{id}/pause\|resume\|cancel` |
 | Salesforce | `GET /api/salesforce/objects\|list\|status/{id}\|files\|clickhouse/{object}`; `POST /start`, `/pause/{id}`, `/resume/{id}`, `/cancel/{id}`; `DELETE /remove/{id}` |
 | HubSpot | same set, plus `POST /api/hubspot/start_all` (both accept `full_refresh`), `GET /api/hubspot/sync_state`, `DELETE /api/hubspot/sync_state/{object}` |
-| Slack | `POST /api/slack/historical/start`, `/realtime/start`, `/realtime/simulate`, `/realtime/event`, `/pause`, `/resume`, `/cancel`; `GET /list`, `/status/{id}`, `/files`, `/clickhouse/{table}`; **`POST /api/slack/events`** (Slack webhook) |
+| Slack | `POST /api/slack/historical/start`, `/realtime/start`, `/realtime/simulate`, `/realtime/event`, `/pause`, `/resume`, `/cancel`; `GET /list`, `/status/{id}`, `/files`, `/clickhouse/{table}`, `/realtime/backlog`; **`POST /api/slack/events`** (Slack webhook) |
 | Analytics | `GET /api/analytics/views`, `GET /api/analytics/inspect/{view_or_table}` |
 | Storage | `GET /api/storage/preview?path=...` |
 
@@ -262,7 +268,7 @@ All `/api/*` routes below require a console session or an HMAC signature, except
 
 ```bash
 pip install -r requirements.txt
-pytest -q                                   # 138 tests (about 2 minutes)
+pytest -q                                   # 151 tests (about 2 minutes)
 
 pip install -r requirements-dev.txt         # adds chdb + moto for the real-ClickHouse tests
 pytest tests/test_clickhouse_real.py -q
@@ -272,7 +278,7 @@ pytest tests/test_clickhouse_real.py -q
 * **Recovery tests** simulate a killed process mid-run (`SystemExit`), restart recovery, and check the final row count and file count: no duplicates, no double counting.
 * **Real-ClickHouse tests** (`tests/test_clickhouse_real.py`) use `chdb` (the actual ClickHouse engine, embedded) and `moto` (an S3-compatible server) so the production sink code runs unchanged: tables, `s3()` loads of JSON and dlt Parquet, partitions, deduplication, all three views.
 * Without `chdb`/`moto` installed, only those 20 tests skip.
-* **Real process kill:** `python scripts/crash_recovery_demo.py` boots the API as a separate process, starts 8 HubSpot jobs and a Slack backfill, sends `SIGKILL` while they are mid-run, restarts on the same database, and checks the exact row and file counts. It runs without Docker and is also part of the test suite (`tests/test_crash_demo_script.py`).
+* **Real process kill:** `python scripts/crash_recovery_demo.py` boots the API as a separate process, starts 8 HubSpot jobs and a Slack backfill, sends `SIGKILL` while they are mid-run, restarts on the same database, and checks the exact row and file counts. It also pauses a real-time stream, sends events while paused, kills the server, and checks that the buffered events survive and arrive after Resume. It runs without Docker and is also part of the test suite (`tests/test_crash_demo_script.py`).
 
 See `VERIFICATION_REPORT.md` for requirement-by-requirement evidence and what is *not* verified.
 
@@ -286,6 +292,8 @@ See `VERIFICATION_REPORT.md` for requirement-by-requirement evidence and what is
 * `v_client_360_deals` links Salesforce and HubSpot by **company name**; production data would be better matched on a shared key such as domain.
 * One API instance only (SQLite state and process-ownership recovery).
 * The load query contains the MinIO keys; for production use ClickHouse named collections.
+* Real-time catch-up reads channel history **after** each channel's mark. It cannot detect a message that was lost *before* a later one was ingested (the mark has already moved past it), and thread replies to messages older than the mark are not re-read. A historical backfill reconciles both (idempotent).
+* The real-time buffer lives in the SQLite database, so it shares the single-instance limit.
 * Slack resume uses the default page size (cursors are valid for any page size).
 * Not tested against live Salesforce, HubSpot, Slack, or a Docker ClickHouse/MinIO; see the verification report.
 
@@ -310,7 +318,7 @@ app/
   routers/              HTTP routes
   static/index.html     web console
 mock_services/          standalone mock Salesforce / HubSpot / Slack
-tests/                  138 tests
+tests/                  151 tests
 scripts/                crash_recovery_demo.py (kill -9 proof)
 sign.py                 HMAC-signed request CLI
 docker-compose.yml  Dockerfile  requirements*.txt  .env.example

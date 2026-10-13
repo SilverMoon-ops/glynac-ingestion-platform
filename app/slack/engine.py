@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from decimal import Decimal
 import io
 import json
 import threading
@@ -12,11 +13,13 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from sqlalchemy.orm import Session
 
-from app.audit import send_to_dead_letter
+from app.audit import log_audit, send_to_dead_letter
 from app.control import CANCEL, PAUSE, claim_job, clear_control, get_control, set_control
 from app.database import SessionLocal
 from app.jobs import transition, update_checkpoint
-from app.models import Job, JobStatus, ChannelCheckpoint
+from app.models import ChannelCheckpoint, Job, JobStatus, RealtimeBacklog, RealtimeMark, RealtimeSeen
+from sqlalchemy import Float, cast, update
+from sqlalchemy.exc import IntegrityError
 from app.config import mock_base_url, settings as app_settings
 from app.errors import ConfigurationError, InfrastructureUnavailable
 from app.retry import with_retry
@@ -213,8 +216,10 @@ def _list_users(client) -> List[Dict]:
 
 
 @with_retry
-def _fetch_page(client, channel_id: str, cursor: Optional[str], page_size: int) -> Dict:
-    return client.fetch_history(channel_id, cursor, page_size)
+def _fetch_page(client, channel_id: str, cursor: Optional[str], page_size: int, oldest: Optional[str] = None) -> Dict:
+    if oldest is None:  # test doubles only implement the plain call
+        return client.fetch_history(channel_id, cursor, page_size)
+    return client.fetch_history(channel_id, cursor, page_size, oldest=oldest)
 
 
 def _cursor_label(cursor: Optional[str]) -> str:
@@ -429,15 +434,28 @@ def ingest_realtime_event(
             f"{row['message_id'].replace(':', '_')}.parquet"
         )
 
-        duplicate = parquet_path in get_storage().list_objects(parquet_path)  # Slack redelivers on timeouts
-        _write_parquet(parquet_path, rows)
+        _write_parquet(parquet_path, rows)  # same message -> same file, so a replay overwrites it
         _load_into_clickhouse("bronze_slack_messages", [parquet_path])
 
-        if not duplicate:  # a redelivery overwrites the same file; never count it twice
+        # Count it exactly once. The "seen" record and the counter commit together, so a retry after a
+        # failure between landing the file and counting it still counts, and a redelivery does not.
+        try:
+            db.add(RealtimeSeen(org_id=org_id, message_id=row["message_id"]))
+            db.flush()  # raises right here if this message was already counted
+        except IntegrityError:
+            db.rollback()
+            duplicate = True
+        else:
             db.query(Job).filter(Job.id == job_id).update(
                 {Job.row_count: Job.row_count + 1}, synchronize_session=False
             )
             db.commit()
+            duplicate = False
+        try:
+            advance_mark(db, org_id, row["channel_id"], row["message_ts"])
+        except Exception as exc:  # noqa: BLE001  the message is safely ingested; catch-up re-reads a little more
+            db.rollback()
+            print(f"[WARN] could not advance real-time mark for {row['channel_id']}: {exc}")
 
         return {
             "status": "ingested",
@@ -458,17 +476,167 @@ def ingest_realtime_event(
         db.close()
 
 
-def create_realtime_job(job_id: str) -> None:
-    db = SessionLocal()
+# ── Real-time: high-water marks, buffering, resume and catch-up ──────────────────────
 
+# A realtime job in any of these states still owns the stream: events are ingested (RUNNING)
+# or buffered (the others). CANCELLED / COMPLETED mean nobody wants them.
+LIVE_STATUSES = (JobStatus.RUNNING.value, JobStatus.PAUSED.value, JobStatus.PENDING.value, JobStatus.FAILED.value)
+
+
+def active_realtime_job(db) -> Optional[Job]:
+    return (
+        db.query(Job)
+        .filter(Job.service == "slack", Job.object_name == "realtime", Job.status.in_(LIVE_STATUSES))
+        .order_by(Job.created_at.desc())
+        .first()
+    )
+
+
+def _ts_value(ts: str) -> Decimal:
+    return Decimal(str(ts))
+
+
+def advance_mark(db, org_id: str, channel_id: str, message_ts: str) -> None:
+    """
+    Remember the newest message_ts ingested per channel. It can only move forward, and that is
+    enforced in ONE atomic SQL statement: concurrent threads (Slack redeliveries are processed
+    in parallel) can neither fail on the first insert nor write an older value over a newer one.
+    """
     try:
-        job = db.query(Job).filter(Job.id == job_id).first()
+        db.add(RealtimeMark(org_id=org_id, channel_id=channel_id, message_ts=str(message_ts)))
+        db.commit()
+        return
+    except IntegrityError:
+        db.rollback()  # the mark already exists
+    db.execute(
+        update(RealtimeMark)
+        .where(
+            RealtimeMark.org_id == org_id,
+            RealtimeMark.channel_id == channel_id,
+            cast(RealtimeMark.message_ts, Float) < float(message_ts),
+        )
+        .values(message_ts=str(message_ts))
+    )
+    db.commit()
 
-        if job is not None and job.status == JobStatus.PENDING.value:
-            transition(db, job, JobStatus.RUNNING)
 
+def buffer_event(db, org_id: str, event: Dict) -> bool:
+    """Durably park an event for later. Returns False if it was already buffered (a redelivery)."""
+    payload = {k: event.get(k) for k in ("id", "channel_id", "user_id", "text", "message_ts", "thread_ts")}
+    db.add(RealtimeBacklog(org_id=org_id, message_id=str(payload["id"]), payload=json.dumps(payload)))
+    try:
+        db.commit()
+        return True
+    except IntegrityError:
+        db.rollback()
+        return False
+
+
+def backlog_size(db, org_id: Optional[str] = None) -> int:
+    q = db.query(RealtimeBacklog)
+    return (q.filter_by(org_id=org_id) if org_id else q).count()
+
+
+def ingest_or_buffer(job_id: str, event: Dict, org_id: str) -> Dict:
+    """
+    Webhook path. Slack has already been answered 200, so an ingestion failure (ClickHouse or
+    MinIO briefly down) must not lose the event: it is buffered and retried at the next resume.
+    """
+    try:
+        return ingest_realtime_event(job_id, event, org_id)
+    except Exception as exc:  # noqa: BLE001
+        db = SessionLocal()
+        try:
+            buffer_event(db, org_id, event)
+            log_audit(db, job_id, "BUFFERED", detail=f"ingest failed, event kept for retry: {exc}")
+        finally:
+            db.close()
+        return {"status": "buffered", "reason": str(exc)}
+
+
+def drain_backlog(job_id: str, org_id: str) -> int:
+    """Ingest buffered events oldest-first. A row is deleted only after it was ingested."""
+    db = SessionLocal()
+    drained = 0
+    try:
+        while True:
+            row = db.query(RealtimeBacklog).filter_by(org_id=org_id).order_by(RealtimeBacklog.id).first()
+            if row is None:
+                return drained
+            ingest_realtime_event(job_id, json.loads(row.payload), org_id)  # raises -> row stays buffered
+            db.delete(row)
+            db.commit()
+            drained += 1
     finally:
         db.close()
+
+
+def catch_up(job_id: str, org_id: str, client=None, page_size: int = 100) -> int:
+    """
+    Fill the gap since the last real-time message: for every channel with a stored mark, read
+    the channel history newer than the mark. Covers pauses, downtime and webhooks Slack gave up
+    on. Ingestion is idempotent, so overlap with buffered or live events is harmless.
+    """
+    db = SessionLocal()
+    try:
+        marks = [(m.channel_id, m.message_ts) for m in db.query(RealtimeMark).filter_by(org_id=org_id).all()]
+    finally:
+        db.close()
+    if not marks:
+        return 0
+    client = client or make_slack_client()
+    _authenticate(client)
+    caught = 0
+    for channel_id, oldest in marks:
+        cursor = None
+        while True:
+            page = _fetch_page(client, channel_id, cursor, page_size, oldest=oldest)
+            for msg in sorted(page["messages"], key=lambda m: _ts_value(m["message_ts"])):
+                event = {k: msg.get(k) for k in ("id", "channel_id", "user_id", "text", "message_ts", "thread_ts")}
+                if not ingest_realtime_event(job_id, event, org_id).get("duplicate"):
+                    caught += 1
+            if not page["has_more"]:
+                break
+            cursor = page["next_cursor"]
+    return caught
+
+
+def create_realtime_job(job_id: str, client=None) -> None:
+    """
+    Start, resume, or crash-recover the real-time stream. Live events are accepted by the webhook
+    endpoint; this brings the stream up to date: drain what was buffered, then catch up from
+    each channel's high-water mark. A failure here fails the job (Resume retries it).
+    """
+    db = SessionLocal()
+    try:
+        job = db.query(Job).filter(Job.id == job_id).first()
+        if job is None:
+            return
+        if job.status == JobStatus.PENDING.value:
+            job = transition(db, job, JobStatus.RUNNING)
+        claim_job(job_id)
+        org_id = job.org_id or "org1"
+    finally:
+        db.close()
+
+    try:
+        drained = drain_backlog(job_id, org_id)
+        caught = catch_up(job_id, org_id, client)
+        if drained or caught:
+            db = SessionLocal()
+            try:
+                log_audit(db, job_id, "REALTIME_SYNC", detail=f"drained {drained} buffered, caught up {caught} from history")
+                print(f"[CHECKPOINT] slack realtime job={job_id[:8]} drained={drained} caught_up={caught}")
+            finally:
+                db.close()
+    except Exception as exc:  # noqa: BLE001
+        db = SessionLocal()
+        try:
+            job = db.query(Job).filter(Job.id == job_id).first()
+            if job is not None and job.status == JobStatus.RUNNING.value:
+                transition(db, job, JobStatus.FAILED, detail=f"real-time resume failed: {exc}")
+        finally:
+            db.close()
 
 
 def seed_metadata(org_id: str, client) -> None:

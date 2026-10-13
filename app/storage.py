@@ -6,6 +6,8 @@ the same way MinIO would organize them. Switch via STORAGE_BACKEND in .env.
 Includes automatic endpoint liveness check: if STORAGE_BACKEND=minio but Docker
 is not running, it falls back to LocalFileStorage instantly without hanging.
 """
+import os
+import uuid
 from io import BytesIO
 from pathlib import Path
 import socket
@@ -42,12 +44,21 @@ class LocalFileStorage:
     def put_object(self, path: str, data: bytes) -> None:
         full_path = self.root / path
         full_path.parent.mkdir(parents=True, exist_ok=True)
-        full_path.write_bytes(data)
+        # Atomic, like an S3 PUT: write a temp file, then rename it into place. Writing the final
+        # path in place lets a concurrent reader see an empty or half-written file (two redeliveries
+        # of the same Slack message are processed at the same time).
+        tmp = full_path.with_name(f".{full_path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            tmp.write_bytes(data)
+            os.replace(tmp, full_path)
+        finally:
+            if tmp.exists():
+                tmp.unlink()
 
     def list_objects(self, prefix: str = "") -> List[str]:
         results = []
         for p in self.root.rglob("*"):
-            if p.is_file():
+            if p.is_file() and not p.name.endswith(".tmp"):  # skip in-flight temp files
                 rel = str(p.relative_to(self.root)).replace("\\", "/")
                 if rel.startswith(prefix):
                     results.append(rel)

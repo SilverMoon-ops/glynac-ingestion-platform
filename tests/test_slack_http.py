@@ -168,6 +168,13 @@ def test_slack_redelivery_is_not_counted_twice(db_session, mock_services, api_se
     assert _wait_for_rows(db_session, job, 1) == 1
     time.sleep(0.3)  # let any (wrongly) double-counted redelivery land before asserting
     assert _reload(db_session, job).row_count == 1
+    # A redelivery is normal, not a failure: it must not leave a dead letter or a buffered copy behind.
+    from app.models import DeadLetter, RealtimeBacklog
+    dead = db_session.query(DeadLetter).filter(DeadLetter.job_id == job.id).all()
+    assert not dead, [d.reason for d in dead]
+    from app.models import AuditLog
+    buffered = [x.detail for x in db_session.query(AuditLog).filter(AuditLog.event == "BUFFERED")]
+    assert db_session.query(RealtimeBacklog).count() == 0, buffered
     assert len(get_storage().list_objects("slack/realtime/")) == 1
 
 
@@ -185,8 +192,8 @@ def test_url_verification_challenge_is_answered(mock_services, api_server):
 
 
 def test_edits_and_bot_messages_are_ignored_and_no_job_still_returns_200(db_session, mock_services, api_server):
-    out = _events(api_server, mock_services)  # no RUNNING realtime job
-    assert out["status_code"] == 200 and out["response"]["reason"] == "no RUNNING realtime job"
+    out = _events(api_server, mock_services)  # no live realtime job
+    assert out["status_code"] == 200 and out["response"]["reason"] == "no live realtime job"
     _running_realtime(db_session)
     out = _events(api_server, mock_services, subtype="message_changed")
     assert out["response"]["status"] == "ignored"
@@ -210,3 +217,28 @@ def test_simulate_button_flow_goes_through_the_signed_webhook(client, db_session
                     headers={**sign_request(body), "Content-Type": "application/json"})
     assert r.status_code == 200 and r.json()["response"]["status"] == "accepted"
     assert _wait_for_rows(db_session, job, 1) == 1
+
+
+def test_local_storage_writes_are_atomic_under_concurrent_readers(tmp_path):
+    """A reader must never see an empty or partial file while another thread rewrites it."""
+    import threading
+
+    from app.storage import LocalFileStorage
+
+    storage = LocalFileStorage(str(tmp_path))
+    payload = b"x" * 200_000
+    storage.put_object("a/b.parquet", payload)
+    seen, stop = [], threading.Event()
+
+    def reader():
+        while not stop.is_set():
+            seen.append(len(storage.get_object("a/b.parquet")))
+
+    t = threading.Thread(target=reader)
+    t.start()
+    for _ in range(300):
+        storage.put_object("a/b.parquet", payload)
+    stop.set()
+    t.join()
+    assert seen and set(seen) == {len(payload)}  # never 0, never partial
+    assert storage.list_objects("a/") == ["a/b.parquet"]  # no temp files left behind or listed

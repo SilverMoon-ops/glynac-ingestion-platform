@@ -4,6 +4,8 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
+from sqlalchemy import update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models import SyncState
@@ -37,15 +39,26 @@ def get_high_water(db: Session, service: str, org_id: str, object_name: str) -> 
 
 
 def advance_high_water(db: Session, service: str, org_id: str, object_name: str, value: Optional[str]) -> None:
-    """Move the mark forward; never backwards."""
+    """
+    Move the mark forward, never backwards, in one atomic SQL statement (two runs finishing at
+    the same moment must not let the older value win). The stored values are normalised UTC
+    ISO-8601 strings, which sort chronologically as text.
+    """
     if not value:
         return
-    row = db.query(SyncState).filter_by(service=service, org_id=org_id, object_name=object_name).first()
-    if row is None:
-        db.add(SyncState(service=service, org_id=org_id, object_name=object_name, high_water_mark=iso(parse_ts(value))))
-    elif parse_ts(value) > parse_ts(row.high_water_mark):
-        row.high_water_mark = iso(parse_ts(value))
-        db.add(row)
+    new = iso(parse_ts(value))
+    try:
+        db.add(SyncState(service=service, org_id=org_id, object_name=object_name, high_water_mark=new))
+        db.commit()
+        return
+    except IntegrityError:
+        db.rollback()  # the mark already exists
+    db.execute(
+        update(SyncState)
+        .where(SyncState.service == service, SyncState.org_id == org_id,
+               SyncState.object_name == object_name, SyncState.high_water_mark < new)
+        .values(high_water_mark=new)
+    )
     db.commit()
 
 

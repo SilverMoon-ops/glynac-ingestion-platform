@@ -103,12 +103,13 @@ class SlackClient:
             "reactions": msg.get("reactions", []),
         }
 
-    def fetch_history(self, channel_id: str, cursor: Optional[str], page_size: int = 10) -> dict:
+    def fetch_history(self, channel_id: str, cursor: Optional[str], page_size: int = 10,
+                      oldest: Optional[str] = None) -> dict:
         """
         One page of channel history (newest first) plus the replies of every threaded
-        message on it. Returns {"messages": [flat dicts], "next_cursor": str|None, "has_more": bool}.
+        message on it. With `oldest`, only messages newer than that Slack ts are returned. Returns {"messages": [flat dicts], "next_cursor": str|None, "has_more": bool}.
         """
-        body = self._call("conversations.history", channel=channel_id, cursor=cursor, limit=page_size)
+        body = self._call("conversations.history", channel=channel_id, cursor=cursor, limit=page_size, oldest=oldest)
         messages = [self._flatten(channel_id, m) for m in body.get("messages", [])]
         for parent in body.get("messages", []):
             if parent.get("reply_count"):

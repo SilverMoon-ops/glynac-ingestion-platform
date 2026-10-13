@@ -122,3 +122,44 @@ class SyncState(Base):
     object_name = Column(String, primary_key=True)
     high_water_mark = Column(String, nullable=False)  # ISO-8601, UTC
     updated_at = Column(DateTime(timezone=True), default=_now, onupdate=_now)
+
+
+class RealtimeBacklog(Base):
+    """
+    Real-time Slack events that could not be ingested yet (stream paused, or ingestion failed).
+    Slack has already been told "200 OK", so this table is the only copy: it is drained, in order,
+    when the stream resumes. (org, message) is unique, so Slack redeliveries do not pile up.
+    """
+
+    __tablename__ = "realtime_backlog"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    org_id = Column(String, nullable=False, index=True)
+    message_id = Column(String, nullable=False)
+    payload = Column(Text, nullable=False)  # the normalised event, JSON
+    received_at = Column(DateTime(timezone=True), default=_now)
+
+    __table_args__ = (UniqueConstraint("org_id", "message_id", name="uq_realtime_backlog_message"),)
+
+
+class RealtimeMark(Base):
+    """Newest Slack message_ts ingested in real-time mode, per organisation and channel."""
+
+    __tablename__ = "realtime_mark"
+
+    org_id = Column(String, primary_key=True)
+    channel_id = Column(String, primary_key=True)
+    message_ts = Column(String, nullable=False)
+
+
+class RealtimeSeen(Base):
+    """
+    Which real-time messages have been ingested and counted. Inserted in the same transaction as the
+    job's row-count increment, so "counted exactly once" survives redeliveries, retries after a
+    partial failure, and crashes between landing the file and counting it.
+    """
+
+    __tablename__ = "realtime_seen"
+
+    org_id = Column(String, primary_key=True)
+    message_id = Column(String, primary_key=True)

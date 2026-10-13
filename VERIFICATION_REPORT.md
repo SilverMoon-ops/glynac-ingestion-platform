@@ -10,14 +10,15 @@ How each requirement of the task brief (BE-1, BE-2, BE-3) is met, and **how that
 | **Real ClickHouse** | The production ClickHouse code runs against the actual ClickHouse engine (`chdb`, embedded; version `26.9`) reading files from an S3-compatible server (`moto`) with the `s3()` table function. Not Docker, not MinIO itself. |
 | **Process kill** | The API runs as a separate OS process and is killed with `SIGKILL`. |
 
-**Test suite: 138 tests, all passing** (`pytest -q`, about 2 minutes).
+**Test suite: 151 tests, all passing** (`pytest -q`, about 2 minutes).
 
 | File | Tests | Covers |
 |---|---:|---|
 | `test_salesforce_http.py` | 18 | Bulk API over HTTP: all 10 objects, `Sforce-Locator` paging, 429/500 retry, bad credentials fail fast, session refresh, dead letters |
-| `test_hubspot_incremental.py` | 9 | Incremental sync: only changed records fetched, mark moves only on completion, crash resumes with the same cut-off, files never overwritten, per-organisation marks |
+| `test_slack_realtime_pause.py` | 11 | Real-time pause is immediate, events buffered during a pause and drained on resume, failed ingests buffered, catch-up from high-water marks, crash recovery of the stream, concurrent mark creation |
+| `test_hubspot_incremental.py` | 10 | Incremental sync: only changed records fetched, mark moves only on completion, crash resumes with the same cut-off, files never overwritten, per-organisation marks |
 | `test_hubspot_http.py` | 17 | CRM v3 over HTTP: `after` cursor, all 8 objects, type coercion, retries, bad token, crash and recovery over HTTP |
-| `test_slack_http.py` | 14 | Web API paging and thread replies, one failing channel, resume, signed Events API webhooks (signature, replay, challenge, redelivery) |
+| `test_slack_http.py` | 15 | Web API paging and thread replies, one failing channel, resume, signed Events API webhooks (signature, replay, challenge, redelivery) |
 | `test_clickhouse_real.py` | 21 | Real ClickHouse: tables, partitions, `s3()` loads, dlt Parquet, deduplication, 3 views, incremental update replaces the row, failure visibility |
 | `test_recovery.py` | 9 | Persistent pause/cancel, startup recovery, mid-run crash, crash after the last checkpoint |
 | `test_no_silent_fallbacks.py` | 7 | Unreachable MinIO/ClickHouse, missing credentials fail loudly |
@@ -63,7 +64,7 @@ Status: **Verified** (tests or live runs, section 1 levels) · **Verified with s
 | Real-time latency under 1 second | Verified with stand-ins | Measured mock-Slack to queryable-in-ClickHouse, 8 events: **187 to 237 ms** (first event 1.47 s because it creates the tables). In-process ClickHouse and S3 stand-in; not Docker |
 | Parquet landing grouped by `channel_id` and `processing_date`; `/slack/historical/` and `/slack/realtime/` | Verified | `slack/historical/{org}/channel_id=C001/processing_date=.../part-{label}.parquet`; `slack/realtime/{org}/channel_id=.../processing_date=.../{message}.parquet`. Files and reactions land as separate datasets |
 | ClickHouse tables reading Slack Parquet from MinIO; `v_slack_compliance_timeline` joining users, channels, threads | Verified with stand-ins | `test_slack_tables_and_compliance_view_are_populated_from_parquet`: 81 messages once each, 3 users, 3 channels, files and reactions present, every row has channel and user name, 21 thread replies flagged |
-| Checkpointing (`channel_id` + `message_ts`), pause/resume in **both** modes | Partly. See 7.2 | Historical: per-channel cursor, completed flag, `message_ts`. Real-time: pause stops ingestion but there is no high-water mark |
+| Checkpointing (`channel_id` + `message_ts`), pause/resume in **both** modes | Verified with stand-ins (limits in 7.2) | Historical: per-channel cursor, completed flag, `message_ts`. Real-time: per-channel high-water mark (`realtime_mark`), immediate pause, durable buffer, drain and catch-up on resume, start and crash recovery. `test_events_during_a_pause_are_buffered_then_ingested_in_order_on_resume`, `test_catch_up_fills_the_gap_after_downtime_from_the_channels_history`; real `kill -9` in section 3 |
 | Parallel channel workers | Verified | One thread per channel; `test_historical_over_http...` and section 3 |
 | Crash recovery, zero missing or duplicate messages | **Verified with a real `kill -9`** | Section 3: killed at 78 of 240 messages, finished with exactly 240 |
 
@@ -81,21 +82,24 @@ Status: **Verified** (tests or live runs, section 1 levels) · **Verified with s
 
 ## 3. Crash recovery: real `kill -9`
 
-`python scripts/crash_recovery_demo.py` (also `tests/test_crash_demo_script.py`). It boots the API as a separate process, starts 8 HubSpot jobs plus a Slack historical backfill, waits until they are mid-run, sends `SIGKILL`, restarts on the same database, and checks the result. Actual output (the AFTER-restart table is condensed to one line):
+`python scripts/crash_recovery_demo.py` (also `tests/test_crash_demo_script.py`). It boots the API as a separate process, starts 8 HubSpot jobs, a Slack historical backfill and a real-time stream, waits until they are mid-run, sends `SIGKILL`, restarts on the same database, and checks the result. For the real-time stream it sends 2 live events, pauses, sends 3 more (buffered), kills the server, restarts, and resumes. Actual output (the AFTER-restart table is condensed to two lines; the `rows saved so far` column is each job's saved checkpoint, so the 20 to 40 values are jobs killed mid-run):
 
 ```
+real-time: live events -> ['accepted', 'accepted']; stream paused; events while paused -> ['buffered', 'buffered', 'buffered']
 BEFORE kill -9:
-  hubspot  Companies    COMPLETED  rows saved so far: 47
-  hubspot  Contacts     RUNNING    rows saved so far: 40
-  hubspot  Deals        RUNNING    rows saved so far: 30
-  hubspot  Engagements  RUNNING    rows saved so far: 30
-  hubspot  LineItems    RUNNING    rows saved so far: 30
-  hubspot  Owners       RUNNING    rows saved so far: 40
-  hubspot  Pipelines    RUNNING    rows saved so far: 20
-  hubspot  Tickets      RUNNING    rows saved so far: 20
-  slack    historical   RUNNING    rows saved so far: 78
+  hubspot  Companies    RUNNING    rows saved so far: 20
+  hubspot  Contacts     RUNNING    rows saved so far: 30
+  hubspot  Deals        RUNNING    rows saved so far: 40
+  hubspot  Engagements  RUNNING    rows saved so far: 40
+  hubspot  LineItems    RUNNING    rows saved so far: 40
+  hubspot  Owners       RUNNING    rows saved so far: 20
+  hubspot  Pipelines    RUNNING    rows saved so far: 30
+  hubspot  Tickets      RUNNING    rows saved so far: 40
+  slack    historical   RUNNING    rows saved so far: 39
+  slack    realtime     PAUSED     rows saved so far: 2
 *** SIGKILL sent; restarting the server on the same database ***
-AFTER restart: all 8 HubSpot jobs COMPLETED with 47 rows; slack historical COMPLETED with 240 rows
+AFTER restart: all 8 HubSpot jobs COMPLETED with 47 rows; slack historical COMPLETED with 240 rows;
+               slack realtime still PAUSED with its 2 live rows
 CHECKS:
   PASS  all 8 HubSpot jobs COMPLETED after the crash
   PASS  every HubSpot job has exactly 47 rows (no loss, no double count)
@@ -103,7 +107,14 @@ CHECKS:
   PASS  Slack backfill COMPLETED after the crash
   PASS  Slack has exactly 240 messages (3 channels x (60 + 20 thread replies))
   PASS  18 unique Slack message files
-  PASS  RECOVERY audit entries written for the resumed jobs (8 found)
+  PASS  RECOVERY audit entries written for the resumed jobs (9 found)
+  PASS  live events accepted; events during the pause answered 200 and buffered
+  PASS  real-time job is still PAUSED after the crash, with its 2 live rows (not auto-resumed)
+  PASS  the 3 events buffered during the pause survived kill -9 (in the database)
+  PASS  after Resume the stream has all 5 messages (2 live + 3 buffered): none lost
+  PASS  the buffer is empty after the drain
+  PASS  5 unique real-time message files in storage
+RESULT: ALL CHECKS PASSED
 ```
 
 Why no duplicates: a page is landed as a file named by its cursor (a replay overwrites it), then ClickHouse loads it (`ReplacingMergeTree` by id), then cursor, row count and completed flag are saved in one commit. A crash loses at most the page in flight. The server log shows `[CHECKPOINT] ...` lines for every saved page and `[RECOVERY] resuming ...` at restart.
@@ -139,6 +150,12 @@ Each is covered by a test or by the process-kill script.
 | 23 | Console failures were silent; job errors never shown | Operator could not see why | Errors surfaced; red infrastructure banner |
 | 24 | No file preview in the MinIO browser | Brief requirement unmet | `/api/storage/preview` and clickable files |
 | 25 | HubSpot file names did not identify the run | An incremental run in the same month would overwrite the full run's raw files | File names include the job id; test checks the earlier files are byte-identical afterwards |
+| 26 | **Real-time pause was a no-op.** A real-time job has no worker loop, so the pause request (a flag nothing read) never took effect: the job stayed `RUNNING` and kept ingesting, and Resume returned 409 because it was never `PAUSED`. (An earlier draft of this report described it as "events dropped while paused"; that was wrong.) | Pause and resume for the real-time stream did not exist | Pause transitions immediately; events are buffered while paused; resume drains and catches up |
+| 27 | A webhook ingest that failed after Slack had been answered 200 was only logged | The event was lost permanently | Failed ingests are buffered and retried on the next resume or restart |
+| 28 | "Already counted?" was decided by whether the file existed | A retry after a failure between landing the file and counting it was treated as a duplicate and never counted | A database record committed in the same transaction as the counter |
+| 29 | The duplicate record's insert was flushed outside the guarded block | Every Slack redelivery took the failure path: a spurious dead letter and a buffered copy (counts still looked right) | Flush inside the guard; the redelivery test now also asserts no dead letters and no buffered rows |
+| 30 | Local storage wrote files in place | Under concurrent redeliveries a reader saw an empty file (`Parquet file size is 0 bytes`) | Atomic temp-file-and-rename writes, like an S3 PUT |
+| 31 | High-water marks were read-modify-write | Concurrent threads failed on the first insert, and a later writer could set an **older** value over a newer one (marks moved backwards) | Insert, then one atomic conditional `UPDATE ... WHERE value < new`; applied to Slack real-time marks and HubSpot sync state |
 
 Because the secret was committed in `sign.py` and was in the page, **rotate `HMAC_SECRET`** if this repository was ever shared.
 
@@ -159,7 +176,7 @@ See the README ("Reliability design") for the state machine, checkpoint, recover
 ## 7. Gaps against the brief and known limitations
 
 1. **Incremental sync details (BE-2 item 1).** Implemented (README, "Incremental sync"). Known limits: deletions are not detected (use a full refresh to reconcile); HubSpot's search caps one query at 10,000 results (the mock does not enforce it); the state store is our own table, so dlt's built-in incremental state is not used; `Owners` and `Pipelines` always do a full refresh because HubSpot has no search for them. Verified against the mock's search semantics only: real HubSpot's search index can lag a few seconds behind writes, which the default 60-second overlap is meant to absorb but which has not been tested live.
-2. **Real-time pause (BE-3).** Webhooks that arrive while the real-time job is `PAUSED` are acknowledged and discarded, and no real-time high-water mark is stored. After resuming, run a historical backfill to fill the gap (safe and idempotent).
+2. **Real-time stream limits (BE-3).** Pause, buffering, resume and catch-up are implemented and verified (defects 26 to 31). Remaining limits: catch-up reads history after each channel's mark, so it cannot detect a message lost *before* a later one was ingested (the mark has already passed it), and it does not re-read thread replies to messages older than the mark; a historical backfill reconciles both and is idempotent. Catch-up depends on Slack's history rate limits. The buffer lives in the SQLite database (single-instance limit, item 6). Verified against the mock Slack only.
 3. **Real-time landing writes one tiny Parquet file per message.** Correct and idempotent, but a small-files pattern; production would micro-batch.
 4. **HubSpot Owners and Pipelines** use dedicated endpoints and a different response shape in real HubSpot; the client treats all eight uniformly. Real deals need the company association requested to carry `company_id`.
 5. **`v_client_360_deals` joins by company name**; a shared key such as domain would be better in production.

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import requests
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
@@ -9,10 +9,13 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.jobs import create_job, get_job_or_404, transition
-from app.models import Job, JobStatus
+from app.models import Job, JobStatus, RealtimeMark
 from app.schemas import JobOut
 from app.security import require_signed_request
 from app.slack.engine import (
+    active_realtime_job,
+    backlog_size,
+    buffer_event,
     clear_control_events,
     create_realtime_job,
     ingest_realtime_event,
@@ -129,6 +132,12 @@ def pause_slack_job(job_id: str, db: Session = Depends(get_db)):
             detail=f"Job is {job.status}, not RUNNING.",
         )
 
+    if job.object_name == "realtime":
+        # A real-time job has no worker loop that could notice a pause request, so pausing is
+        # immediate: from now on incoming events are buffered, then drained on resume.
+        clear_control_events(job_id)
+        return transition(db, job, JobStatus.PAUSED, detail="real-time paused; incoming events are buffered")
+
     request_pause(job_id)
 
     return job
@@ -222,37 +231,32 @@ def receive_realtime_event(
     payload: SlackEventRequest,
     db: Session = Depends(get_db),
 ):
-    job = (
-        db.query(Job)
-        .filter(
-            Job.service == "slack",
-            Job.object_name == "realtime",
-            Job.status == JobStatus.RUNNING.value,
-        )
-        .order_by(Job.created_at.desc())
-        .first()
-    )
-
+    """HMAC-authenticated way to inject one event (the Slack-signed webhook is /api/slack/events)."""
+    job = active_realtime_job(db)
     if job is None:
-        raise HTTPException(
-            status_code=409,
-            detail="No RUNNING realtime Slack job exists.",
-        )
+        raise HTTPException(status_code=409, detail="No live realtime Slack job exists.")
 
     event = payload.model_dump()
-
     if not event.get("event_id"):
-        event["event_id"] = (
-            f"{payload.channel_id}:{payload.message_ts}"
-        )
-
+        event["event_id"] = f"{payload.channel_id}:{payload.message_ts}"
     event["id"] = event["event_id"]
 
-    return ingest_realtime_event(
-        job_id=job.id,
-        event=event,
-        org_id=job.org_id or "org1",
-    )
+    if job.status != JobStatus.RUNNING.value:
+        return {"status": "buffered", "reason": f"realtime job is {job.status}",
+                "buffered": buffer_event(db, job.org_id or "org1", event)}
+    return ingest_realtime_event(job_id=job.id, event=event, org_id=job.org_id or "org1")
+
+
+@router.get("/realtime/backlog")
+def realtime_backlog(org_id: Optional[str] = None, db: Session = Depends(get_db)):
+    """Events waiting for the stream to be resumed, and the per-channel high-water marks."""
+    marks = db.query(RealtimeMark)
+    if org_id:
+        marks = marks.filter_by(org_id=org_id)
+    return {
+        "buffered": backlog_size(db, org_id),
+        "marks": [{"org_id": m.org_id, "channel_id": m.channel_id, "message_ts": m.message_ts} for m in marks.all()],
+    }
 
 
 class SimulateRequest(BaseModel):

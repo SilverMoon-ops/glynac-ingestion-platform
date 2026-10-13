@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models import Job, JobStatus
-from app.slack.engine import ingest_realtime_event
+from app.slack.engine import active_realtime_job, buffer_event, ingest_or_buffer
 from app.slack.events import signing_secret, verify
 
 router = APIRouter(prefix="/api/slack", tags=["slack-events"])
@@ -43,15 +43,10 @@ async def slack_events(request: Request, background_tasks: BackgroundTasks, db: 
     if event.get("type") != "message" or event.get("subtype") or event.get("bot_id"):
         return {"status": "ignored", "reason": "not a plain user message"}
 
-    job = (
-        db.query(Job)
-        .filter(Job.service == "slack", Job.object_name == "realtime", Job.status == JobStatus.RUNNING.value)
-        .order_by(Job.created_at.desc())
-        .first()
-    )
+    job = active_realtime_job(db)
     if job is None:
-        # Acknowledge with 200 so Slack does not keep retrying; nothing is listening for it.
-        return {"status": "ignored", "reason": "no RUNNING realtime job"}
+        # Acknowledge with 200 so Slack does not keep retrying; nobody is listening for it.
+        return {"status": "ignored", "reason": "no live realtime job"}
 
     ts = event["ts"]
     thread_ts = event.get("thread_ts")
@@ -63,5 +58,12 @@ async def slack_events(request: Request, background_tasks: BackgroundTasks, db: 
         "message_ts": ts,
         "thread_ts": thread_ts if thread_ts and thread_ts != ts else None,
     }
-    background_tasks.add_task(ingest_realtime_event, job.id, normalised, job.org_id or "org1")
+    org_id = job.org_id or "org1"
+    if job.status != JobStatus.RUNNING.value:
+        # Paused (or failed, or not started yet): Slack gets its 200, and the event is parked in the
+        # database. Resume drains it in order. Nothing is dropped.
+        buffer_event(db, org_id, normalised)
+        return {"status": "buffered", "reason": f"realtime job is {job.status}", "message_id": normalised["id"]}
+
+    background_tasks.add_task(ingest_or_buffer, job.id, normalised, org_id)
     return {"status": "accepted", "message_id": normalised["id"]}

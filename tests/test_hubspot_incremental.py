@@ -163,3 +163,31 @@ def test_sync_state_api_lists_and_resets_marks(client, db_session, mock_services
     assert reset.json() == {"reset": True}
     assert client.get("/api/hubspot/sync_state", headers=sign_request()).json()["states"] == []
     assert _mode(_run(db_session)) == "full"  # no mark -> full again
+
+
+def test_concurrent_runs_finishing_together_never_move_the_mark_backwards(db_session):
+    """Two runs of the same object can finish at the same moment; the older value must never win."""
+    import threading
+
+    from sqlalchemy.orm import sessionmaker
+
+    from app.sync_state import advance_high_water
+
+    Session = sessionmaker(bind=db_session.get_bind())
+    barrier, errors = threading.Barrier(8), []
+
+    def work(i):
+        db = Session()
+        try:
+            barrier.wait()
+            advance_high_water(db, "hubspot", "org1", "Companies", f"2026-03-01T00:00:{i:02d}+00:00")
+        except Exception as exc:  # noqa: BLE001
+            errors.append(repr(exc))
+        finally:
+            db.close()
+
+    threads = [threading.Thread(target=work, args=(i,)) for i in range(8)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert errors == []
+    assert get_high_water(db_session, "hubspot", "org1", "Companies") == "2026-03-01T00:00:07+00:00"

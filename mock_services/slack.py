@@ -137,7 +137,8 @@ def create_app() -> FastAPI:
         return {"ok": True, "members": [{**u, "deleted": False} for u in USERS], "response_metadata": {"next_cursor": ""}}
 
     @app.get("/api/conversations.history")
-    async def history(channel: str, cursor: Optional[str] = None, limit: int = 100, authorization: Optional[str] = Header(None)):
+    async def history(channel: str, cursor: Optional[str] = None, limit: int = 100, oldest: Optional[str] = None,
+                      authorization: Optional[str] = Header(None)):
         if (bad := await _gate("conversations.history", authorization)) is not None:
             return bad
         if channel not in {c["id"] for c in CHANNELS}:
@@ -148,13 +149,15 @@ def create_app() -> FastAPI:
         with state.lock:
             total = state.messages_per_channel
         newest_first = list(range(total - 1, -1, -1))
+        if oldest:  # Slack: only messages newer than `oldest` (exclusive unless inclusive=true)
+            newest_first = [i for i in newest_first if float(_message(channel, i, total)["ts"]) > float(oldest)]
         page = newest_first[pos: pos + limit]
         nxt = pos + len(page)
         return {
             "ok": True,
             "messages": [_message(channel, i, total) for i in page],
-            "has_more": nxt < total,
-            "response_metadata": {"next_cursor": _encode(nxt) if nxt < total else ""},
+            "has_more": nxt < len(newest_first),
+            "response_metadata": {"next_cursor": _encode(nxt) if nxt < len(newest_first) else ""},
         }
 
     @app.get("/api/conversations.replies")
