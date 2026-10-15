@@ -78,7 +78,13 @@ docker compose ps           # all services should be healthy
 | <http://localhost:8123/play> | ClickHouse query UI |
 | <http://localhost:9100/health> | Mock services |
 
-The compose file pins nothing to a specific image version (`latest`). Once it works for you, run `SELECT version()` in ClickHouse and pin that tag in `docker-compose.yml`.
+Verify the whole stack with one command (about 67 checks, 1 to 3 minutes; the last line must be `ALL CHECKS PASSED`):
+
+```bash
+docker compose exec api python scripts/smoke_test.py
+```
+
+The compose file uses `latest` for MinIO and ClickHouse. Once it works for you, pin the versions that are actually running: `python scripts/pin_images.py`. **`RUNBOOK.md`** has the full step-by-step (rotating secrets, checking each view, crash/pause/retry demonstrations, pinning, troubleshooting).
 
 ### Authentication
 
@@ -268,7 +274,7 @@ All `/api/*` routes below require a console session or an HMAC signature, except
 
 ```bash
 pip install -r requirements.txt
-pytest -q                                   # 151 tests (about 2 minutes)
+pytest -q                                   # 160 tests (about 2 minutes)
 
 pip install -r requirements-dev.txt         # adds chdb + moto for the real-ClickHouse tests
 pytest tests/test_clickhouse_real.py -q
@@ -318,8 +324,9 @@ app/
   routers/              HTTP routes
   static/index.html     web console
 mock_services/          standalone mock Salesforce / HubSpot / Slack
-tests/                  151 tests
-scripts/                crash_recovery_demo.py (kill -9 proof)
+tests/                  160 tests
+scripts/                smoke_test.py (end-to-end check of a running stack), crash_recovery_demo.py (kill -9 proof), pin_images.py
+RUNBOOK.md              step-by-step: run, verify, pin, troubleshoot
 sign.py                 HMAC-signed request CLI
 docker-compose.yml  Dockerfile  requirements*.txt  .env.example
 ```

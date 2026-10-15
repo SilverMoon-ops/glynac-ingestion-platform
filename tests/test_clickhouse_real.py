@@ -124,7 +124,7 @@ def test_slack_tables_and_compliance_view_are_populated_from_parquet(db_session,
 
     count = lambda t: real_clickhouse.command(f"SELECT count() FROM {t} FINAL")
     assert count("bronze_slack_messages") == 81 and count("slack_users") == 3 and count("slack_channels") == 3
-    assert count("slack_files") > 0 and count("slack_reactions") > 0  # these were never loaded before
+    assert count("slack_files") == 9 and count("slack_reactions") > 0  # same 9 as the in-memory stand-in shows
 
     view = real_clickhouse.rows("SELECT * FROM v_slack_compliance_timeline")
     assert len(view) == 81  # each message exactly once

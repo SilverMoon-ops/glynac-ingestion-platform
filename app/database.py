@@ -3,17 +3,30 @@ from sqlalchemy.orm import sessionmaker, declarative_base
 
 from app.config import settings
 
-connect_args = {"check_same_thread": False} if settings.database_url.startswith("sqlite") else {}
+def make_engine(url: str, **overrides):
+    """
+    SQLAlchemy engine. For SQLite the connection pool is sized for many concurrent jobs: every
+    running job (10 Salesforce + 8 HubSpot + Slack channel workers) holds a connection while it
+    waits on the network, plus the web requests. SQLAlchemy's default of 15 is exhausted by one
+    click on "Sync all" ("QueuePool limit ... reached"), after which every request fails.
+    """
+    if not url.startswith("sqlite"):
+        return create_engine(url, **overrides)
+    options = {"pool_size": 50, "max_overflow": 50, "pool_timeout": 60}
+    options.update(overrides)
+    eng = create_engine(url, connect_args={"check_same_thread": False}, **options)
 
-engine = create_engine(settings.database_url, connect_args=connect_args)
-
-if settings.database_url.startswith("sqlite"):
-    @event.listens_for(engine, "connect")
+    @event.listens_for(eng, "connect")
     def set_sqlite_pragma(dbapi_connection, connection_record):
         cursor = dbapi_connection.cursor()
         cursor.execute("PRAGMA journal_mode=WAL")
-        cursor.execute("PRAGMA busy_timeout=10000")
+        cursor.execute("PRAGMA busy_timeout=30000")  # wait for a competing writer instead of failing
         cursor.close()
+
+    return eng
+
+
+engine = make_engine(settings.database_url)
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()

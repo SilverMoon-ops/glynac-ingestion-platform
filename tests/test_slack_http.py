@@ -52,6 +52,9 @@ def test_historical_over_http_pages_with_opaque_cursors_and_fetches_thread_repli
     assert calls.count("conversations.replies") == 21  # 7 threaded messages x 3 channels
     assert calls.count("auth.test") == 1
     files = get_storage().list_objects("slack/")
+    from app.clickhouse_sink import get_clickhouse_sink
+    sink_files = get_clickhouse_sink().inserted.get("slack_files", [])
+    assert len(sink_files) == 9  # 3 files per channel x 3 channels (the same file id exists in every channel)
     assert any(f.endswith("metadata/org1/users.parquet") for f in files)
     assert len([f for f in files if "/historical/org1/channel_id=" in f]) == 12  # one message file per page
     assert any("/historical/org1/files/" in f for f in files)  # files and reactions land as their own datasets

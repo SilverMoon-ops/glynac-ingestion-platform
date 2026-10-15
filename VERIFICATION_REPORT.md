@@ -10,7 +10,7 @@ How each requirement of the task brief (BE-1, BE-2, BE-3) is met, and **how that
 | **Real ClickHouse** | The production ClickHouse code runs against the actual ClickHouse engine (`chdb`, embedded; version `26.9`) reading files from an S3-compatible server (`moto`) with the `s3()` table function. Not Docker, not MinIO itself. |
 | **Process kill** | The API runs as a separate OS process and is killed with `SIGKILL`. |
 
-**Test suite: 151 tests, all passing** (`pytest -q`, about 2 minutes).
+**Test suite: 160 tests, all passing** (`pytest -q`, about 2 minutes).
 
 | File | Tests | Covers |
 |---|---:|---|
@@ -23,9 +23,11 @@ How each requirement of the task brief (BE-1, BE-2, BE-3) is met, and **how that
 | `test_recovery.py` | 9 | Persistent pause/cancel, startup recovery, mid-run crash, crash after the last checkpoint |
 | `test_no_silent_fallbacks.py` | 7 | Unreachable MinIO/ClickHouse, missing credentials fail loudly |
 | `test_crash_demo_script.py` | 1 | **Real `kill -9`** of a separate API process (section 3) |
+| `test_compose_and_scripts.py` | 7 | `docker-compose.yml` static checks (no duplicate host ports, restart policy, no host bind mount for the database, demo settings reach the mock container), `.dockerignore`, image-pinning helper |
+| `test_database_pool.py` | 2 | Connection pool holds 40 concurrent job connections; SQLite waits for competing writers |
 | `test_hubspot.py`, `test_salesforce.py`, `test_slack.py`, `test_integration_e2e.py`, `test_production_grade.py`, `test_crash_recovery.py`, `test_jobs.py`, `test_auth.py`, `test_ui_session.py`, `test_storage_preview.py` | 42 | Unit and API behaviour, state machine, HMAC and sessions, file preview |
 
-Reproduce: `pip install -r requirements-dev.txt && pytest -q` and `python scripts/crash_recovery_demo.py`.
+Reproduce: `pip install -r requirements-dev.txt && pytest -q`, `python scripts/crash_recovery_demo.py`, and (against any running stack) `python scripts/smoke_test.py`. The smoke test passes all 67 checks against a local (non-Docker) server; it has not been run against the Docker stack (section 6).
 
 ## 2. Requirement matrix
 
@@ -156,6 +158,11 @@ Each is covered by a test or by the process-kill script.
 | 29 | The duplicate record's insert was flushed outside the guarded block | Every Slack redelivery took the failure path: a spurious dead letter and a buffered copy (counts still looked right) | Flush inside the guard; the redelivery test now also asserts no dead letters and no buffered rows |
 | 30 | Local storage wrote files in place | Under concurrent redeliveries a reader saw an empty file (`Parquet file size is 0 bytes`) | Atomic temp-file-and-rename writes, like an S3 PUT |
 | 31 | High-water marks were read-modify-write | Concurrent threads failed on the first insert, and a later writer could set an **older** value over a newer one (marks moved backwards) | Insert, then one atomic conditional `UPDATE ... WHERE value < new`; applied to Slack real-time marks and HubSpot sync state |
+| 32 | The database connection pool (15) was exhausted by concurrent jobs: every running job holds a connection while it waits on the network (found by the new smoke test) | One click on "Sync all" followed by "Start all 8" made every request fail with a 500 (`QueuePool limit ... reached`) | Pool sized for 100 connections, 30 s busy timeout; a test holds 40 connections at once and fails against the old pool |
+| 33 | `docker-compose.yml` kept the SQLite database in a host folder, ran the API with `--reload`, and had no restart policy | WAL mode misbehaves on Windows/macOS bind mounts; the dev reloader restarts the app on code changes; a crashed API stayed down | Docker-managed volume, no `--reload`, `restart: unless-stopped` |
+| 34 | No `.dockerignore`, and the Dockerfile does `COPY . .` | `.env` (the secrets), `.git` and the local database would be baked into the image | `.dockerignore` |
+| 35 | The mock-services container did not receive the demo settings from `.env`; retry attempts printed nothing | Slowing the mocks for a demo silently had no effect in Docker; a reviewer could not see backoff happening | Settings passed through compose; every retry logs `[RETRY] attempt N failed (...); retrying in Xs` |
+| 36 | The in-memory stand-in de-duplicated Slack files on `file_id` alone; the real table is keyed by `(channel_id, file_id)` | Without Docker the console showed 8 file rows where the real ClickHouse holds 24 | Same key in both; a test asserts the same count against the in-memory path and the real engine |
 
 Because the secret was committed in `sign.py` and was in the page, **rotate `HMAC_SECRET`** if this repository was ever shared.
 

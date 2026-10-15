@@ -95,7 +95,7 @@ _KEYS = {
     "bronze_slack_messages": ("message_id",),
     "slack_users": ("user_id",),
     "slack_channels": ("channel_id",),
-    "slack_files": ("file_id",),
+    "slack_files": ("channel_id", "file_id"),  # same key as the ClickHouse table's ORDER BY
     "slack_reactions": ("message_id", "emoji", "user_id"),
 }
 

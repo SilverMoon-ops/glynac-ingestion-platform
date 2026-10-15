@@ -1,0 +1,21 @@
+# Keep secrets and local state OUT of the image. Settings come from docker-compose (env_file: .env)
+# at run time, never from a file baked into a layer.
+.env
+.env.*
+!.env.example
+.git
+.gitignore
+.venv
+venv
+env
+__pycache__
+*.pyc
+.pytest_cache
+.idea
+.vscode
+data
+*.db
+*.db-wal
+*.db-shm
+.dlt_pipelines
+*.bak

@@ -29,9 +29,11 @@ services:
       SLACK_MOCK_ENABLED: "true"
       API_INTERNAL_URL: http://api:8000   # where the mock Slack delivers Events API webhooks
     volumes:
-      - ./data:/app/data
-      - ./.dlt_pipelines:/app/.dlt_pipelines
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+      # A Docker-managed volume, not a folder from your computer: SQLite's WAL mode misbehaves on
+      # Windows/macOS bind mounts ("database is locked").
+      - api_data:/app/data
+    restart: unless-stopped   # if the API crashes or is killed, Docker restarts it and recovery resumes the jobs
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
     networks:
       - glynac-network
 
@@ -39,6 +41,13 @@ services:
     build: .
     container_name: glynac-mock-services
     command: python -m mock_services
+    restart: unless-stopped
+    environment:
+      # Demo knobs: set these in .env (docker compose reads it) and run `docker compose up -d`.
+      HUBSPOT_MOCK_TOTAL_RECORDS: ${HUBSPOT_MOCK_TOTAL_RECORDS:-47}
+      HUBSPOT_MOCK_LATENCY_SECONDS: ${HUBSPOT_MOCK_LATENCY_SECONDS:-0.05}
+      SLACK_MOCK_MESSAGES_PER_CHANNEL: ${SLACK_MOCK_MESSAGES_PER_CHANNEL:-50}
+      SLACK_MOCK_LATENCY_SECONDS: ${SLACK_MOCK_LATENCY_SECONDS:-0}
     ports:
       - "9100:9000"   # host 9000 is MinIO's; containers reach the mocks at mock-services:9000
     networks:
@@ -89,6 +98,7 @@ services:
       - glynac-network
 
 volumes:
+  api_data:
   minio_data:
   clickhouse_data:
 
