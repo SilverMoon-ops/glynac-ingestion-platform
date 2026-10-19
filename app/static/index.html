@@ -105,7 +105,7 @@ function row(j){
   return `<tr><td><b>${esc(j.service)}</b><br><span class="mono">${esc(j.object_name)} · ${esc(j.org_id)}</span></td>
   <td><span class="badge ${esc(j.status)}">${esc(j.status)}</span></td><td>${esc(j.row_count)}</td><td>${dur(j.duration_seconds||0)}</td><td>${esc(j.retry_count)}</td>
   <td class="err">${esc(j.error||"")}</td><td><div class="row">${btn}
-  <button data-act="inspect" data-svc="${esc(j.service)}" data-obj="${esc(j.object_name)}">Table</button>
+  <button data-act="inspect" data-svc="${esc(j.service)}" data-obj="${esc(j.object_name)}" data-org="${esc(j.org_id)}">Table</button>
   <button data-act="logs" data-job="${esc(j.id)}">Logs</button></div></td></tr>`;
 }
 async function loadViews(){
@@ -137,11 +137,11 @@ document.addEventListener("click",async e=>{
   const a=b.dataset.act,svc=b.dataset.svc;
   try{
     if(a.startsWith("job-")){b.disabled=true;await post(`/api/${svc}/${a.slice(4)}/${b.dataset.job}`);refresh();return}
-    if(a==="inspect"){const o=svc==="slack"?b.dataset.obj:b.dataset.obj;const d=await api(`/api/${svc}/clickhouse/${encodeURIComponent(o)}`);modal(svc+" table",tableHtml(d));return}
+    if(a==="inspect"){const o=svc==="slack"?b.dataset.obj:b.dataset.obj;const d=await api(`/api/${svc}/clickhouse/${encodeURIComponent(o)}?org_id=${encodeURIComponent(b.dataset.org||ORG())}`);modal(svc+" table",tableHtml(d));return}
     if(a==="preview"){const d=await api("/api/storage/preview?path="+encodeURIComponent(b.dataset.path));
       const cols=d.columns.map(c=>c.name);
       modal(d.path,`<p>${esc(d.format)} · ${esc(d.size_bytes)} bytes${d.num_rows!=null?" · "+esc(d.num_rows)+" rows":""}</p>`+(d.format==="text"?`<pre>${esc(d.text)}</pre>`:`<p class="sub">Columns: ${d.columns.map(c=>esc(c.name)+" ("+esc(c.type)+")").join(", ")}</p><div class="wrap"><table><thead><tr>${cols.map(c=>`<th>${esc(c)}</th>`).join("")}</tr></thead><tbody>${d.rows.map(r=>`<tr>${cols.map(c=>`<td class="mono">${esc(typeof r[c]==="object"?JSON.stringify(r[c]):r[c])}</td>`).join("")}</tr>`).join("")}</tbody></table></div>`));return}
-    if(a==="view"){modal(b.dataset.name,tableHtml(await api("/api/analytics/inspect/"+encodeURIComponent(b.dataset.name))));return}
+    if(a==="view"){modal(b.dataset.name,tableHtml(await api("/api/analytics/inspect/"+encodeURIComponent(b.dataset.name)+"?org_id="+encodeURIComponent(ORG()))));return}
     if(a==="logs"){const [au,dl]=await Promise.all([api(`/api/jobs/${b.dataset.job}/audit`),api(`/api/jobs/${b.dataset.job}/dead_letters`)]);
       modal("Job logs",`<h3>Audit trail</h3><pre>${esc(au.map(x=>`${x.created_at}  ${x.event}  ${x.detail||""}`).join("\n")||"No events")}</pre><h3>Dead letters (${dl.length})</h3><pre>${esc(dl.map(x=>`${x.reason}: ${x.record}`).join("\n")||"None")}</pre>`);return}
     if(actions[a])await actions[a]();

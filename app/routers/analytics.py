@@ -50,13 +50,13 @@ def list_analytical_views():
 
 
 @router.get("/inspect/{target_name}")
-def inspect_table_or_view(target_name: str, service: Optional[str] = None):
+def inspect_table_or_view(target_name: str, service: Optional[str] = None, org_id: Optional[str] = None):
     """
     Inspect any table or curated analytical view. Returns column definitions,
     row counts, and a sample of live records.
     """
     sink = get_clickhouse_sink()
-    return sink.inspect_table(target_name, service=service)
+    return sink.inspect_table(target_name, service=service, org_id=org_id)
 
 
 @router.get("/status")
@@ -76,7 +76,7 @@ def system_components_status():
         out["problems"].append(str(exc))
     try:
         sink = get_clickhouse_sink()
-        out["clickhouse_mode"] = "Live ClickHouse Server" if hasattr(sink, "client") else "In-Memory NullSink (ClickHouse disabled)"
+        out["clickhouse_mode"] = "Live ClickHouse Server" if getattr(sink, "is_live", False) else "In-Memory NullSink (ClickHouse disabled)"
     except InfrastructureUnavailable as exc:
         out["clickhouse_mode"] = "UNREACHABLE"
         out["problems"].append(str(exc))

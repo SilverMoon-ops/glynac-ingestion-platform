@@ -86,6 +86,9 @@ In the page header you should see `storage: MinioStorage` and `clickhouse: Live 
 
 ## 3. Automatic verification (run this first)
 
+> **If you ran an earlier version of this project in Docker**, start clean. Old runs leave data behind (partial loads, files in an older layout) that makes counts confusing:
+> `docker compose down -v` (this **deletes** the database, MinIO files and ClickHouse data), then `docker compose up -d --build`.
+
 ```bash
 docker compose exec api python scripts/smoke_test.py
 ```
@@ -94,7 +97,7 @@ It runs inside the API container, drives every pipeline through the real API, an
 
 What it checks (about 67 checks): MinIO and ClickHouse reachable; all 10 Salesforce objects loaded and queryable; all 8 HubSpot objects loaded in parallel, Parquet files landed, and a second run that re-reads only recent records (incremental); Slack backfill (messages, users, channels, files, reactions); a signed real-time webhook, **pause**, an event **buffered** during the pause, and **resume**; file preview; and the three analytical views joined correctly.
 
-It uses its own organisation (`smoke`), so you can run it as often as you like.
+Each run uses a **fresh organisation** (printed at the top as `organisation for this run: smoke-xxxxxx`), so earlier or partial runs cannot affect the numbers, and it checks that every table holds **exactly** the rows its job reported, not just "more than zero". Run it as often as you like.
 
 * `WARN` lines are not failures. If it warns "ClickHouse is DISABLED" or "LOCAL DISK", you are not running the Docker stack.
 * On any `FAIL`, copy the whole output and the output of `docker compose logs api --tail 100`. That is enough to diagnose it.
@@ -262,6 +265,7 @@ pytest -q                        # about 2 minutes; expect: all passed
 | Login says **wrong password** | The container still has the old value. After editing `.env` run `docker compose up -d api` (a plain restart does not re-read it). |
 | Red banner "**MinIO ... unreachable**" | `docker compose ps`: is `minio` healthy? Do `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` in `.env` equal `glynac_admin` / `glynac_secret_key`? |
 | Red banner "**ClickHouse ... unreachable**" | `docker compose logs clickhouse`. Usually still starting (wait 30 s) or out of memory (raise Docker's RAM). |
+| Jobs `FAILED` with **`Attempt to execute concurrent queries within the same session`** | You are running an old image. This was fixed (each worker thread now has its own ClickHouse client). Rebuild: `docker compose up -d --build`. |
 | Jobs `FAILED` mentioning **ACCESS_DENIED** and `S3` | The ClickHouse user lacks permission to use the `s3()` function. Try: `docker compose exec clickhouse clickhouse-client --user glynac --password glynac_secret --query "GRANT S3 ON *.* TO glynac"`. If that is refused, add `CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1` under the clickhouse `environment:` and `docker compose up -d clickhouse`. (I could not test the Docker ClickHouse image; send me the exact error if it persists.) |
 | Jobs `FAILED` mentioning **mock services are not reachable** | `docker compose logs mock-services`. The API must have `MOCK_SERVICES_URL: http://mock-services:9000` (it does by default). |
 | **Port is already allocated** | Another program uses that port. Edit the left number of the `ports:` entry. |

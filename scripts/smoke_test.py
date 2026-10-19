@@ -11,12 +11,15 @@ What it covers: infrastructure status, all 10 Salesforce objects, all 8 HubSpot 
 incremental state), the Slack historical backfill, the real-time stream (live event, pause, buffering,
 resume), file preview, and the three analytical views. Exit code 0 = everything passed.
 
-It uses its own organisation id (--org, default "smoke"), so it does not touch other data.
+Every run uses a fresh organisation id (--org to choose one), so earlier or partial runs cannot
+pollute the numbers: each table is compared with exactly what its job reported (de-duplicated rows
+for that organisation), not just "more than zero".
 """
 import argparse
 import os
 import sys
 import time
+import uuid
 
 import httpx
 
@@ -46,7 +49,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--url", default=os.getenv("API_BASE_URL", "http://localhost:8000"))
     ap.add_argument("--password", default=os.getenv("UI_PASSWORD", ""))
-    ap.add_argument("--org", default="smoke")
+    ap.add_argument("--org", default=f"smoke-{uuid.uuid4().hex[:6]}")
     ap.add_argument("--timeout", type=int, default=180, help="seconds to wait for each group of jobs")
     args = ap.parse_args()
     if not args.password:
@@ -54,6 +57,14 @@ def main():
 
     c = httpx.Client(base_url=args.url.rstrip("/"), timeout=60)
     org = args.org
+    print(f"organisation for this run: {org}")
+
+    def describe(j):
+        """Real status and reason for a job (never assume it completed)."""
+        return f"{j.get('status', 'MISSING')} with {j.get('row_count')} rows"
+
+    def why(j):
+        return j.get("error") or ""
 
     def jobs_by_id(ids):
         wanted = set(ids)
@@ -113,14 +124,15 @@ def main():
             sf_ids[obj] = r.json()["id"]
         else:
             check(False, f"start {obj}", r.text[:150])
-    done = wait_all(list(sf_ids.values()), "Salesforce jobs")
+    sf_done = wait_all(list(sf_ids.values()), "Salesforce jobs")
     for obj, jid in sf_ids.items():
-        j = done.get(jid, {})
-        check(j.get("status") == "COMPLETED" and j.get("row_count", 0) > 0,
-              f"{obj}: COMPLETED with {j.get('row_count')} rows", j.get("error") or j.get("status"))
+        j = sf_done.get(jid, {})
+        check(j.get("status") == "COMPLETED" and j.get("row_count", 0) > 0, f"{obj}: {describe(j)}", why(j))
     for obj in SF_OBJECTS:
-        t = c.get(f"/api/salesforce/clickhouse/{obj}").json()
-        check(t.get("exists") and t.get("row_count", 0) > 0, f"{obj}: table {t.get('table_name')} has {t.get('row_count')} rows",
+        j = sf_done.get(sf_ids.get(obj), {})
+        t = c.get(f"/api/salesforce/clickhouse/{obj}", params={"org_id": org}).json()
+        check(t.get("exists") and t.get("row_count") == j.get("row_count") and j.get("row_count", 0) > 0,
+              f"{obj}: table {t.get('table_name')} holds {t.get('row_count')} rows (the job loaded {j.get('row_count')})",
               t.get("error", ""))
     files = c.get("/api/salesforce/files").json().get("files", [])
     check(len(files) >= 10, f"{len(files)} raw files landed in storage (JSON)")
@@ -133,17 +145,18 @@ def main():
     r = c.post("/api/hubspot/start_all", json={"org_id": org}).json()
     hs_ids = {j["object_name"]: j["job_id"] for j in r.get("jobs", [])}
     check(len(hs_ids) == 8, "8 HubSpot jobs started in parallel")
-    done = wait_all(list(hs_ids.values()), "HubSpot jobs")
+    hs_done = wait_all(list(hs_ids.values()), "HubSpot jobs")
     for obj in HS_OBJECTS:
-        j = done.get(hs_ids.get(obj), {})
-        check(j.get("status") == "COMPLETED" and j.get("row_count", 0) > 0,
-              f"{obj}: COMPLETED with {j.get('row_count')} rows", j.get("error") or j.get("status"))
+        j = hs_done.get(hs_ids.get(obj), {})
+        check(j.get("status") == "COMPLETED" and j.get("row_count", 0) > 0, f"{obj}: {describe(j)}", why(j))
     for obj in HS_OBJECTS:
-        t = c.get(f"/api/hubspot/clickhouse/{obj}").json()
-        check(t.get("exists") and t.get("row_count", 0) > 0, f"{obj}: table {t.get('table_name')} has {t.get('row_count')} rows",
+        j = hs_done.get(hs_ids.get(obj), {})
+        t = c.get(f"/api/hubspot/clickhouse/{obj}", params={"org_id": org}).json()
+        check(t.get("exists") and t.get("row_count") == j.get("row_count") and j.get("row_count", 0) > 0,
+              f"{obj}: table {t.get('table_name')} holds {t.get('row_count')} rows (the job loaded {j.get('row_count')})",
               t.get("error", ""))
-    pq = [f for f in c.get("/api/hubspot/files").json().get("files", []) if f.endswith(".parquet")]
-    check(len(pq) >= 8, f"{len(pq)} Parquet files landed (year=/month= layout)")
+    pq = [f for f in c.get("/api/hubspot/files").json().get("files", []) if f.endswith(".parquet") and f"/{org}/" in f]
+    check(len(pq) >= 8, f"{len(pq)} Parquet files landed for this run (year=/month= layout)")
     if pq:
         pv = c.get("/api/storage/preview", params={"path": pq[0]}).json()
         check(pv.get("format") == "parquet" and pv.get("columns"), f"Parquet preview works ({pq[0]})")
@@ -151,15 +164,15 @@ def main():
     check({"Companies", "Deals", "Contacts"} <= marks, f"incremental high-water marks stored for {len(marks)} objects")
     again = c.post("/api/hubspot/start", json={"object_name": "Companies", "org_id": org}).json()
     j = wait_all([again["id"]], "incremental HubSpot run").get(again["id"], {})
-    check(j.get("status") == "COMPLETED" and j.get("row_count", 99) <= 3,
-          f"second Companies run is incremental: re-read only {j.get('row_count')} record(s), not all", j.get("error", ""))
+    first = hs_done.get(hs_ids.get("Companies"), {}).get("row_count", 0)
+    check(j.get("status") == "COMPLETED" and 0 <= j.get("row_count", 99) <= 3 < first,
+          f"second Companies run is incremental: re-read {j.get('row_count')} of {first} records", why(j))
 
     # ── 4. Slack: historical backfill ───────────────────────────────────────────────
     section("Slack: historical backfill (parallel channels)")
     hist = c.post("/api/slack/historical/start", json={"org_id": org, "page_size": 10}).json()
     j = wait_all([hist["id"]], "Slack backfill").get(hist["id"], {})
-    check(j.get("status") == "COMPLETED" and j.get("row_count", 0) > 0,
-          f"backfill COMPLETED with {j.get('row_count')} messages", j.get("error") or j.get("status"))
+    check(j.get("status") == "COMPLETED" and j.get("row_count", 0) > 0, f"backfill: {describe(j)}", why(j))
     for t in ("messages", "users", "channels", "files", "reactions"):
         info = c.get(f"/api/slack/clickhouse/{t}").json()
         check(info.get("exists") and info.get("row_count", 0) > 0, f"Slack {t}: {info.get('row_count')} rows", info.get("error", ""))
@@ -193,22 +206,30 @@ def main():
           "after resume the buffered event is ingested and the buffer is empty")
 
     # ── 6. Analytical views ─────────────────────────────────────────────────────────
-    section("ClickHouse analytical views")
-    v = c.get("/api/analytics/inspect/v_hubspot_deal_pipeline").json()
-    sample = (v.get("sample") or [{}])[0]
-    check(v.get("exists") and v.get("row_count", 0) > 0, f"v_hubspot_deal_pipeline: {v.get('row_count')} rows", v.get("error", ""))
-    check(bool(sample.get("company_name")) and bool(sample.get("pipeline_label")),
-          "  deals are joined to their company and pipeline", str(sample)[:150])
-    v = c.get("/api/analytics/inspect/v_client_360_deals").json()
-    sample = (v.get("sample") or [{}])[0]
-    check(v.get("exists") and v.get("row_count", 0) > 0, f"v_client_360_deals: {v.get('row_count')} rows", v.get("error", ""))
-    check(bool(sample.get("account_name")) and bool(sample.get("hubspot_deal_id")),
-          "  Salesforce opportunity -> account -> HubSpot company -> HubSpot deal", str(sample)[:150])
-    v = c.get("/api/analytics/inspect/v_slack_compliance_timeline").json()
-    sample = (v.get("sample") or [{}])[0]
+    section("ClickHouse analytical views (for this run's organisation)")
+
+    def view(name, **params):
+        return c.get(f"/api/analytics/inspect/{name}", params=params).json()
+
+    deals_loaded = hs_done.get(hs_ids.get("Deals"), {}).get("row_count")
+    v = view("v_hubspot_deal_pipeline", org_id=org)
+    check(v.get("exists") and v.get("row_count") == deals_loaded,
+          f"v_hubspot_deal_pipeline: {v.get('row_count')} rows, one per deal ({deals_loaded} deals loaded)", v.get("error", ""))
+    sample = v.get("sample") or []
+    check(bool(sample) and all(r.get("company_name") and r.get("pipeline_label") for r in sample),
+          "  every sampled deal is joined to its company and its pipeline", str(sample[:1])[:200])
+    opps = sf_done.get(sf_ids.get("Opportunities"), {}).get("row_count", 0)
+    v = view("v_client_360_deals", org_id=org)
+    check(v.get("exists") and v.get("row_count", 0) >= opps > 0,
+          f"v_client_360_deals: {v.get('row_count')} rows for {opps} opportunities", v.get("error", ""))
+    sample = v.get("sample") or []
+    check(bool(sample) and all(r.get("account_name") and r.get("hubspot_deal_id") for r in sample),
+          "  every sampled row: Salesforce opportunity -> account -> HubSpot company -> HubSpot deal", str(sample[:1])[:260])
+    v = view("v_slack_compliance_timeline")
     check(v.get("exists") and v.get("row_count", 0) > 0, f"v_slack_compliance_timeline: {v.get('row_count')} rows", v.get("error", ""))
-    check(bool(sample.get("channel_name")) and bool(sample.get("user_name")),
-          "  messages are joined to channel and user names", str(sample)[:150])
+    sample = v.get("sample") or []
+    check(bool(sample) and all(r.get("channel_name") and r.get("user_name") for r in sample),
+          "  every sampled message is joined to its channel and user name", str(sample[:1])[:200])
 
     # ── summary ─────────────────────────────────────────────────────────────────────
     print(f"\n{len(passed)} passed, {len(failed)} failed, {len(warnings)} warning(s)")

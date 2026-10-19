@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import io
 import json
+import threading
 from typing import Dict, Iterable, List, Optional, Protocol, Tuple
 
 from app.config import settings
@@ -107,7 +108,7 @@ class ClickHouseSink(Protocol):
     def ensure_view(self, object_name: str, service: str = "salesforce") -> None: ...
     def ensure_slack_views(self) -> None: ...
     def ensure_analytical_views(self) -> None: ...
-    def inspect_table(self, table_or_object_name: str, service: Optional[str] = None) -> dict: ...
+    def inspect_table(self, table_or_object_name: str, service: Optional[str] = None, org_id: Optional[str] = None) -> dict: ...
     def _table_name(self, object_name: str, service: str = "salesforce") -> str: ...
 
 
@@ -138,6 +139,8 @@ class NullClickHouseSink:
     Views are computed with the same join keys as the real SQL; a missing match is None,
     never an invented value. Restarting the app loses this data; it is not a database.
     """
+
+    is_live = False
 
     def __init__(self):
         self.tables_created: set[str] = set()
@@ -273,12 +276,14 @@ class NullClickHouseSink:
             return sorted(out, key=lambda r: r["message_ts"] or "", reverse=True)
         return None
 
-    def inspect_table(self, table_or_object_name: str, service: Optional[str] = None) -> dict:
+    def inspect_table(self, table_or_object_name: str, service: Optional[str] = None, org_id: Optional[str] = None) -> dict:
         target = table_or_object_name
         if service and not target.startswith("bronze_") and not target.startswith("v_"):
             target = self._table_name(table_or_object_name, service)
 
         view_rows = self._view_rows(target) if target.startswith("v_") else None
+        if view_rows is not None and org_id:
+            view_rows = [r for r in view_rows if r.get("organisation_id") in (None, org_id) or "organisation_id" not in r]
         if target.startswith("v_"):
             if view_rows is None:
                 return {"exists": False, "mode": "in-memory (ClickHouse disabled)", "table_name": target,
@@ -303,6 +308,8 @@ class NullClickHouseSink:
                     target = k
                     break
 
+        if org_id and any("organisation_id" in r for r in rows):
+            rows = [r for r in rows if r.get("organisation_id") == org_id]
         columns = [{"name": s[0], "type": s[1]} for s in schema] if schema else []
         return {
             "exists": bool(schema or rows),
@@ -314,19 +321,41 @@ class NullClickHouseSink:
         }
 
 
-class RealClickHouseSink:
-    def __init__(self, client=None):
-        if client is None:
-            import clickhouse_connect  # imported lazily so it isn't required for local dev
+def _default_client_factory():
+    import clickhouse_connect  # imported lazily so it isn't required for local dev
 
-            client = clickhouse_connect.get_client(
-                host=settings.clickhouse_host,
-                port=settings.clickhouse_port,
-                username=settings.clickhouse_user,
-                password=settings.clickhouse_password,
-                database=settings.clickhouse_database,
-            )
-        self.client = client
+    return clickhouse_connect.get_client(
+        host=settings.clickhouse_host,
+        port=settings.clickhouse_port,
+        username=settings.clickhouse_user,
+        password=settings.clickhouse_password,
+        database=settings.clickhouse_database,
+    )
+
+
+class RealClickHouseSink:
+    """
+    One sink is shared by the whole app, but every worker THREAD gets its own ClickHouse client.
+    A client carries a ClickHouse session, and ClickHouse allows only one running query per
+    session: sharing one client across the parallel Salesforce / HubSpot / Slack workers fails with
+    "Attempt to execute concurrent queries within the same session".
+    """
+
+    is_live = True
+
+    def __init__(self, client=None, client_factory=None):
+        self._fixed_client = client  # tests may inject one client; production uses the factory
+        self._client_factory = client_factory or _default_client_factory
+        self._local = threading.local()
+
+    @property
+    def client(self):
+        if self._fixed_client is not None:
+            return self._fixed_client
+        client = getattr(self._local, "client", None)
+        if client is None:
+            client = self._local.client = self._client_factory()
+        return client
 
     _table_name = staticmethod(_table_name)
 
@@ -456,7 +485,7 @@ class RealClickHouseSink:
             SETTINGS join_use_nulls = 1
         """)
 
-    def inspect_table(self, table_or_object_name: str, service: Optional[str] = None) -> dict:
+    def inspect_table(self, table_or_object_name: str, service: Optional[str] = None, org_id: Optional[str] = None) -> dict:
         table = table_or_object_name
         if service and not table.startswith("bronze_") and not table.startswith("v_"):
             table = self._table_name(table_or_object_name, service)
@@ -473,13 +502,19 @@ class RealClickHouseSink:
                     "sample": [],
                 }
 
-            row_count_res = self.client.command(f"SELECT count() FROM {table}")
-            row_count = int(row_count_res) if row_count_res is not None else 0
-
             desc = self.client.query(f"DESCRIBE TABLE {table}").result_rows
             columns = [{"name": r[0], "type": r[1]} for r in desc]
 
-            sample_query = self.client.query(f"SELECT * FROM {table} LIMIT 10")
+            # FINAL: ClickHouse merges duplicate versions of a row in the background, so a plain
+            # count() can show several times the real number of rows after re-runs and recoveries.
+            final = "" if table.startswith("v_") else " FINAL"
+            where = ""
+            if org_id and any(c["name"] == "organisation_id" for c in columns):
+                where = f" WHERE organisation_id = '{_q(org_id)}'"
+
+            row_count_res = self.client.command(f"SELECT count() FROM {table}{final}{where}")
+            row_count = int(row_count_res) if row_count_res is not None else 0
+            sample_query = self.client.query(f"SELECT * FROM {table}{final}{where} LIMIT 10")
             col_names = sample_query.column_names
             sample = [dict(zip(col_names, r)) for r in sample_query.result_rows]
 

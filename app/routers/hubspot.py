@@ -197,9 +197,9 @@ def browse_landed_files(object_name: Optional[str] = None):
 
 
 @router.get("/clickhouse/{object_name}")
-def inspect_clickhouse_table(object_name: str):
+def inspect_clickhouse_table(object_name: str, org_id: Optional[str] = None):
     sink = get_clickhouse_sink()
-    return sink.inspect_table(object_name, service="hubspot")
+    return sink.inspect_table(object_name, service="hubspot", org_id=org_id)
 
 
 @router.get("/sync_state")

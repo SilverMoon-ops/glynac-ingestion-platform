@@ -10,7 +10,7 @@ How each requirement of the task brief (BE-1, BE-2, BE-3) is met, and **how that
 | **Real ClickHouse** | The production ClickHouse code runs against the actual ClickHouse engine (`chdb`, embedded; version `26.9`) reading files from an S3-compatible server (`moto`) with the `s3()` table function. Not Docker, not MinIO itself. |
 | **Process kill** | The API runs as a separate OS process and is killed with `SIGKILL`. |
 
-**Test suite: 160 tests, all passing** (`pytest -q`, about 2 minutes).
+**Test suite: 167 tests, all passing** (`pytest -q`, about 2 minutes).
 
 | File | Tests | Covers |
 |---|---:|---|
@@ -19,7 +19,7 @@ How each requirement of the task brief (BE-1, BE-2, BE-3) is met, and **how that
 | `test_hubspot_incremental.py` | 10 | Incremental sync: only changed records fetched, mark moves only on completion, crash resumes with the same cut-off, files never overwritten, per-organisation marks |
 | `test_hubspot_http.py` | 17 | CRM v3 over HTTP: `after` cursor, all 8 objects, type coercion, retries, bad token, crash and recovery over HTTP |
 | `test_slack_http.py` | 15 | Web API paging and thread replies, one failing channel, resume, signed Events API webhooks (signature, replay, challenge, redelivery) |
-| `test_clickhouse_real.py` | 21 | Real ClickHouse: tables, partitions, `s3()` loads, dlt Parquet, deduplication, 3 views, incremental update replaces the row, failure visibility |
+| `test_clickhouse_real.py` | 28 | Real ClickHouse: tables, partitions, `s3()` loads, dlt Parquet, deduplication, 3 views, incremental update replaces the row, failure visibility; **18 jobs loading in parallel with a strict one-query-per-client harness**, deduplicated and per-organisation counts, and `scripts/smoke_test.py` run end to end against the real API on the real engine |
 | `test_recovery.py` | 9 | Persistent pause/cancel, startup recovery, mid-run crash, crash after the last checkpoint |
 | `test_no_silent_fallbacks.py` | 7 | Unreachable MinIO/ClickHouse, missing credentials fail loudly |
 | `test_crash_demo_script.py` | 1 | **Real `kill -9`** of a separate API process (section 3) |
@@ -27,7 +27,7 @@ How each requirement of the task brief (BE-1, BE-2, BE-3) is met, and **how that
 | `test_database_pool.py` | 2 | Connection pool holds 40 concurrent job connections; SQLite waits for competing writers |
 | `test_hubspot.py`, `test_salesforce.py`, `test_slack.py`, `test_integration_e2e.py`, `test_production_grade.py`, `test_crash_recovery.py`, `test_jobs.py`, `test_auth.py`, `test_ui_session.py`, `test_storage_preview.py` | 42 | Unit and API behaviour, state machine, HMAC and sessions, file preview |
 
-Reproduce: `pip install -r requirements-dev.txt && pytest -q`, `python scripts/crash_recovery_demo.py`, and (against any running stack) `python scripts/smoke_test.py`. The smoke test passes all 67 checks against a local (non-Docker) server; it has not been run against the Docker stack (section 6).
+Reproduce: `pip install -r requirements-dev.txt && pytest -q`, `python scripts/crash_recovery_demo.py`, and (against any running stack) `python scripts/smoke_test.py`. The smoke test passes all 67 checks against a local (non-Docker) server; a first run on the Docker stack found defect 37 below; the fix is verified against the real ClickHouse engine (including the smoke script itself, in the test suite) but the Docker stack still has to be re-run (section 6).
 
 ## 2. Requirement matrix
 
@@ -163,6 +163,10 @@ Each is covered by a test or by the process-kill script.
 | 34 | No `.dockerignore`, and the Dockerfile does `COPY . .` | `.env` (the secrets), `.git` and the local database would be baked into the image | `.dockerignore` |
 | 35 | The mock-services container did not receive the demo settings from `.env`; retry attempts printed nothing | Slowing the mocks for a demo silently had no effect in Docker; a reviewer could not see backoff happening | Settings passed through compose; every retry logs `[RETRY] attempt N failed (...); retrying in Xs` |
 | 36 | The in-memory stand-in de-duplicated Slack files on `file_id` alone; the real table is keyed by `(channel_id, file_id)` | Without Docker the console showed 8 file rows where the real ClickHouse holds 24 | Same key in both; a test asserts the same count against the in-memory path and the real engine |
+| 37 | **One ClickHouse client was shared by every worker thread** (found by the first run of the smoke test on Docker: 17 of 67 checks failed) | ClickHouse allows one running query per session, so any two jobs loading at once failed with `Attempt to execute concurrent queries within the same session`: about half of the parallel Salesforce, HubSpot and Slack-channel jobs failed partway, HubSpot marks never advanced (they move only on completion), and a view joined nothing because Accounts had failed | Each worker thread gets its own client. Tests: a strict client that rejects concurrent use, 18 jobs loading in parallel into the real engine, and a mutation test showing the old shared-client behaviour reproduces the exact error |
+| 38 | Why the test suite missed 37: the real-ClickHouse test client had a lock that serialised everything | The bug was invisible to every test | The harness client now behaves like the real one (one query at a time per client); the smoke script runs inside the test suite against the real API, real engine and S3 storage |
+| 39 | The table inspector counted raw rows and all organisations (it showed `bronze_salesforce_accounts has 450 rows` for 30 records) | Misleading numbers in the console and the smoke test | `SELECT count() ... FINAL`, with an optional `org_id` filter; the console passes the job's organisation |
+| 40 | The smoke test printed "COMPLETED" for jobs that had failed, reused one organisation (old or partial data polluted it) and only asked for "more than 0 rows" | A failing run looked partly successful | Fresh organisation per run, real status shown, each table must hold exactly what its job loaded |
 
 Because the secret was committed in `sign.py` and was in the page, **rotate `HMAC_SECRET`** if this repository was ever shared.
 
@@ -172,7 +176,7 @@ See the README ("Reliability design") for the state machine, checkpoint, recover
 
 ## 6. Not verified
 
-* **`docker compose up`** (MinIO, ClickHouse, API, mock services). Never run. After starting it, run one job from the UI and open each view.
+* **The Docker stack after the thread-safety fix.** The stack was started on a real machine once: MinIO, ClickHouse, the API and the mock services all came up and the first Salesforce and Slack loads worked, which is how defect 37 was found. The fix has been verified against the real ClickHouse engine, not yet on Docker. Rebuild (`docker compose down -v && docker compose up -d --build`) and re-run `scripts/smoke_test.py`.
 * **A real ClickHouse server and real MinIO.** Verified against the embedded ClickHouse engine and an S3-compatible server. The SQL is standard, but server version differences are possible. Both compose images are `latest`; pin to the version that works for you.
 * **Live Salesforce, HubSpot and Slack.** The clients follow each service's documented behaviour and run identically against the mocks; they have never called the real APIs.
 * **The console in a real browser.** The API calls the page makes were exercised, and the page's JavaScript was not run in a browser here.

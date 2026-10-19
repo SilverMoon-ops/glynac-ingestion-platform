@@ -18,9 +18,9 @@ class _Result:
 
 
 class ChdbClient:
-    def __init__(self, session):
+    def __init__(self, session, lock=None):
         self._session = session
-        self._lock = threading.Lock()  # chdb sessions are not safe for concurrent use
+        self._lock = lock or threading.Lock()  # the embedded engine is process-wide: serialise access
 
     def _run(self, sql):
         with self._lock:
@@ -48,3 +48,29 @@ class ChdbClient:
             for r in self.rows("SELECT name, engine FROM system.tables WHERE database = currentDatabase()"):
                 kind = "VIEW" if r["engine"] == "View" else "TABLE"
                 self._run(f"DROP {kind} IF EXISTS `{r['name']}`")
+
+
+class StrictChdbClient(ChdbClient):
+    """
+    Behaves like a real clickhouse_connect client: ONE running query per client (= per ClickHouse
+    session). A second thread using the same client while it is busy fails with the same error the
+    real server gives. The engine lock only serialises the embedded engine itself; it must not
+    hide the conflict, which is why `busy` is set BEFORE waiting for that lock.
+    """
+
+    def __init__(self, session, lock=None):
+        super().__init__(session, lock)
+        self._busy = False
+        self._guard = threading.Lock()
+
+    def _run(self, sql):
+        with self._guard:
+            if self._busy:
+                raise RuntimeError("Attempt to execute concurrent queries within the same session. "
+                                   "Please use a separate client instance per thread/process.")
+            self._busy = True
+        try:
+            return super()._run(sql)
+        finally:
+            with self._guard:
+                self._busy = False

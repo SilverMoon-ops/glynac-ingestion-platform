@@ -16,7 +16,9 @@ from app.config import settings
 def db_session(tmp_path, monkeypatch):
     """Fresh SQLite file per test so tests never see each other's jobs."""
     db_path = tmp_path / "test.db"
-    engine = create_engine(f"sqlite:///{db_path}", connect_args={"check_same_thread": False})
+    from app.database import make_engine
+
+    engine = make_engine(f"sqlite:///{db_path}")  # same pool settings as production
     TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     Base.metadata.create_all(bind=engine)
 
@@ -210,9 +212,15 @@ def real_clickhouse(_s3_server, db_session, monkeypatch):
     monkeypatch.setattr(settings, "clickhouse_s3_endpoint", "")
     storage_module._storage_instance = None
 
-    client = ChdbClient(chdb.session.Session())
+    import threading
+
+    from tests.clickhouse_harness import StrictChdbClient
+
+    session, engine_lock = chdb.session.Session(), threading.Lock()
+    client = ChdbClient(session, engine_lock)  # what tests use to look at the data
     client.reset()
-    sink_module._sink_instance = RealClickHouseSink(client=client)
+    # Production path: every worker thread gets its OWN strict client, like the real sink does.
+    sink_module._sink_instance = RealClickHouseSink(client_factory=lambda: StrictChdbClient(session, engine_lock))
     yield client
     client.reset()
     sink_module._sink_instance = None

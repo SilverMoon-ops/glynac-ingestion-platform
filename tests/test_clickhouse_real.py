@@ -168,3 +168,165 @@ def test_incremental_update_replaces_the_changed_row_in_clickhouse(db_session, m
     assert real_clickhouse.command("SELECT count() FROM bronze_hubspot_companies FINAL") == 50
     name = real_clickhouse.command("SELECT name FROM bronze_hubspot_companies FINAL WHERE id = 'companies-mock-org-3'")
     assert name == "Renamed Co"  # the old row was replaced, not duplicated
+
+
+# ── Concurrency: the failure seen on a real Docker run ("concurrent queries within the same session") ──
+
+def test_the_strict_harness_reproduces_the_real_session_conflict(real_clickhouse):
+    """If this ever stops raising, the harness has gone back to hiding the bug."""
+    import threading
+
+    import chdb.session
+
+    from tests.clickhouse_harness import StrictChdbClient
+
+    shared = StrictChdbClient(chdb.session.Session(), threading.Lock())
+    errors = []
+
+    def hammer():
+        for _ in range(40):
+            try:
+                shared.command("SELECT 1")
+            except RuntimeError as exc:
+                errors.append(str(exc))
+
+    threads = [threading.Thread(target=hammer) for _ in range(4)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert any("concurrent queries within the same session" in e for e in errors)
+
+
+def test_each_thread_gets_its_own_client_so_parallel_use_never_conflicts(real_clickhouse):
+    import threading
+
+    import app.clickhouse_sink as sink_module
+
+    sink, errors, clients = sink_module._sink_instance, [], set()
+
+    def work():
+        try:
+            for _ in range(30):
+                sink.client.command("SELECT 1")
+            clients.add(id(sink.client))
+        except Exception as exc:  # noqa: BLE001
+            errors.append(repr(exc))
+
+    threads = [threading.Thread(target=work) for _ in range(6)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert errors == [] and len(clients) == 6
+
+
+def _run_all_in_parallel(db_session, sf_objects, hs_objects, org="par"):
+    """What the console does with 'Sync all' + 'Start all 8': every job at the same moment."""
+    import threading
+
+    plan = []
+    for obj in sf_objects:
+        plan.append(("salesforce", obj, create_job(db_session, service="salesforce", object_name=obj, org_id=org).id))
+    for obj in hs_objects:
+        plan.append(("hubspot", obj, create_job(db_session, service="hubspot", object_name=obj, org_id=org).id))
+    # Plain ids only: ORM objects belong to the test's one session, which is not thread-safe.
+    runners = {"salesforce": run_salesforce_ingestion, "hubspot": run_hubspot_ingestion}
+    crashed = {}
+
+    def run(svc, obj, job_id):
+        try:
+            runners[svc](job_id, obj, org)
+        except BaseException as exc:  # a worker that dies silently would leave its job PENDING
+            crashed[(svc, obj)] = repr(exc)
+
+    threads = [threading.Thread(target=run, args=item) for item in plan]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert crashed == {}, crashed
+    db_session.expire_all()
+    return {(svc, obj): db_session.query(Job).get(job_id) for svc, obj, job_id in plan}
+
+
+def test_ten_salesforce_and_eight_hubspot_jobs_in_parallel_all_load(db_session, mock_services, real_clickhouse):
+    mock_services.salesforce(polls_to_complete=1)
+    sf = ["Accounts", "Contacts", "Opportunities", "Leads", "Tasks", "Cases", "Products", "PricebookEntries",
+          "Contracts", "Assets"]
+    hs = ["Contacts", "Companies", "Deals", "Tickets", "LineItems", "Engagements", "Pipelines", "Owners"]
+    done = _run_all_in_parallel(db_session, sf, hs)
+
+    bad = {k: (j.status, j.error) for k, j in done.items() if j.status != JobStatus.COMPLETED.value}
+    assert bad == {}
+    for (svc, obj), job in done.items():
+        table = f"bronze_{svc}_{obj.lower()}"
+        loaded = real_clickhouse.command(f"SELECT count() FROM {table} FINAL WHERE organisation_id = 'par'")
+        assert loaded == job.row_count, (table, loaded, job.row_count)  # the table holds what the job reported
+
+
+def test_parallel_jobs_fail_exactly_as_on_the_docker_run_if_one_client_is_shared(db_session, mock_services, real_clickhouse):
+    """Mutation proof: with a single shared client (the old behaviour) the same run produces the user's error."""
+    import threading
+
+    import chdb.session
+
+    import app.clickhouse_sink as sink_module
+    from app.clickhouse_sink import RealClickHouseSink
+    from tests.clickhouse_harness import StrictChdbClient
+
+    shared = StrictChdbClient(chdb.session.Session(), threading.Lock())
+    sink_module._sink_instance = RealClickHouseSink(client=shared)  # old behaviour: one client for everything
+    mock_services.salesforce(polls_to_complete=1)
+    done = _run_all_in_parallel(db_session, ["Accounts", "Contacts", "Leads", "Cases"],
+                                ["Companies", "Deals", "Tickets"])
+    errors = " ".join(str(j.error) for j in done.values())
+    assert "concurrent queries within the same session" in errors
+
+
+# ── The inspector shows the deduplicated, per-organisation truth ──────────────────────
+
+def test_inspector_counts_distinct_rows_not_unmerged_duplicate_versions(db_session, mock_services, real_clickhouse):
+    from app.clickhouse_sink import get_clickhouse_sink
+
+    mock_services.salesforce(polls_to_complete=1, record_count=30)
+    _sf(db_session, "Accounts")
+    real_clickhouse.command("SYSTEM STOP MERGES bronze_salesforce_accounts")  # keep duplicate versions unmerged
+    _sf(db_session, "Accounts")
+    _sf(db_session, "Accounts")
+
+    assert real_clickhouse.command("SELECT count() FROM bronze_salesforce_accounts") == 90  # raw, unmerged
+    info = get_clickhouse_sink().inspect_table("Accounts", service="salesforce")
+    assert info["row_count"] == 30  # what the console used to show as 450 for 30 records
+
+
+def test_inspector_can_be_filtered_to_one_organisation(db_session, mock_services, real_clickhouse):
+    from app.clickhouse_sink import get_clickhouse_sink
+
+    mock_services.salesforce(polls_to_complete=1, record_count=30)
+    for org in ("org1", "org2"):
+        job = create_job(db_session, service="salesforce", object_name="Accounts", org_id=org)
+        run_salesforce_ingestion(job.id, "Accounts", org)
+    sink = get_clickhouse_sink()
+    assert sink.inspect_table("Accounts", service="salesforce")["row_count"] == 60
+    only = sink.inspect_table("Accounts", service="salesforce", org_id="org2")
+    assert only["row_count"] == 30 and {r["organisation_id"] for r in only["sample"]} == {"org2"}
+
+
+def test_the_smoke_script_passes_against_the_api_running_on_a_real_clickhouse_engine(
+    db_session, mock_services, real_clickhouse, api_server, monkeypatch
+):
+    """
+    The same command a user runs against Docker (`scripts/smoke_test.py`), against the real API with
+    the real ClickHouse engine reading S3 storage. This is the check that catches problems which only
+    appear with real concurrency and a real database (it found the shared-session failure).
+    """
+    import subprocess
+    import sys
+
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "ui_password", "pw")
+    root = __import__("os").path.dirname(__import__("os").path.dirname(__import__("os").path.abspath(__file__)))
+    result = subprocess.run(
+        [sys.executable, "scripts/smoke_test.py", "--url", api_server, "--password", "pw", "--timeout", "150"],
+        cwd=root, capture_output=True, text=True, timeout=290,
+    )
+    failing = [l for l in result.stdout.splitlines() if "FAIL" in l or "timed out" in l]
+    assert result.returncode == 0, "\n".join(failing) + "\n" + result.stderr[-600:]
+    assert "ALL CHECKS PASSED" in result.stdout
+    assert "Live ClickHouse Server" in result.stdout and "MinioStorage" in result.stdout

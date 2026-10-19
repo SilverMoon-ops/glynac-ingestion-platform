@@ -103,10 +103,10 @@ def browse_landed_files(object_name: Optional[str] = None):
 
 
 @router.get("/clickhouse/{object_name}")
-def inspect_clickhouse_table(object_name: str):
+def inspect_clickhouse_table(object_name: str, org_id: Optional[str] = None):
     """
     'Inspect ClickHouse Table' action. Returns table schema, live or mock row count,
     and sample rows for both ClickHouse-enabled and in-memory modes.
     """
     sink = get_clickhouse_sink()
-    return sink.inspect_table(object_name, service="salesforce")
+    return sink.inspect_table(object_name, service="salesforce", org_id=org_id)

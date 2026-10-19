@@ -209,7 +209,7 @@ SLACK_TABLES = {
 
 
 @router.get("/clickhouse/{object_name}")
-def inspect_clickhouse_table(object_name: str):
+def inspect_clickhouse_table(object_name: str, org_id: Optional[str] = None):
     """
     Inspect a Slack ClickHouse table. The UI passes the job's object_name
     ("historical" / "realtime"), both of which land in the messages table.
@@ -223,7 +223,7 @@ def inspect_clickhouse_table(object_name: str):
             status_code=404,
             detail=f"Unknown Slack table '{object_name}'. Valid: {sorted(SLACK_TABLES)}",
         )
-    return get_clickhouse_sink().inspect_table(table)
+    return get_clickhouse_sink().inspect_table(table, org_id=org_id)
 
 
 @router.post("/realtime/event")

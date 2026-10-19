@@ -200,6 +200,7 @@ The state store is our own table (`app/sync_state.py`), not dlt's internal state
 | **Retries** | Exponential backoff with jitter (up to 5 attempts) for **transient** failures only: HTTP 429, 5xx, dropped connections. Bad credentials and 4xx errors fail fast with a clear message. |
 | **Dead letters** | Records without an id/organisation are stored in `dead_letters` with the reason instead of being lost or crashing the batch. |
 | **Audit** | Every state change and checkpoint is written to `audit_log` and shown per job. |
+| **Thread-safe ClickHouse access** | Every worker thread has its own ClickHouse client (a client is a ClickHouse session, which runs one query at a time), so parallel jobs never collide. |
 | **Atomic counting and marks** | Row counts use SQL `row_count = row_count + n`. High-water marks (Slack real-time, HubSpot incremental) move forward in a single atomic SQL statement, so concurrent threads can neither fail on the first insert nor write an older value over a newer one. Local-storage writes are atomic (temp file + rename), like an S3 PUT. |
 | **Failure visibility** | One failing Slack channel fails the job and names the channel; Resume re-reads only that channel. |
 
@@ -274,7 +275,7 @@ All `/api/*` routes below require a console session or an HMAC signature, except
 
 ```bash
 pip install -r requirements.txt
-pytest -q                                   # 160 tests (about 2 minutes)
+pytest -q                                   # 167 tests (about 2 minutes)
 
 pip install -r requirements-dev.txt         # adds chdb + moto for the real-ClickHouse tests
 pytest tests/test_clickhouse_real.py -q
@@ -324,7 +325,7 @@ app/
   routers/              HTTP routes
   static/index.html     web console
 mock_services/          standalone mock Salesforce / HubSpot / Slack
-tests/                  160 tests
+tests/                  167 tests
 scripts/                smoke_test.py (end-to-end check of a running stack), crash_recovery_demo.py (kill -9 proof), pin_images.py
 RUNBOOK.md              step-by-step: run, verify, pin, troubleshoot
 sign.py                 HMAC-signed request CLI
