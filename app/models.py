@@ -163,3 +163,17 @@ class RealtimeSeen(Base):
 
     org_id = Column(String, primary_key=True)
     message_id = Column(String, primary_key=True)
+
+
+class UsedNonce(Base):
+    """Nonces of accepted signed requests. A repeated (client_id, nonce) is a replay and is rejected.
+
+    Lives in the database, not in memory, so replay protection also holds across processes and restarts.
+    Rows older than the signature window are purged: a replay that old fails the timestamp check anyway.
+    """
+
+    __tablename__ = "used_nonces"
+
+    client_id = Column(String, primary_key=True)
+    nonce = Column(String, primary_key=True)
+    seen_at = Column(Integer, nullable=False, index=True)  # unix seconds

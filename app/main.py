@@ -8,6 +8,7 @@ from fastapi.staticfiles import StaticFiles
 from app.database import init_db
 from app.errors import InfrastructureUnavailable
 from app.recovery import recover_interrupted_jobs
+from app.security import validate_security_settings
 from app.routers import auth, system, jobs, salesforce, hubspot, slack, slack_events, analytics, storage_browser
 
 
@@ -30,6 +31,7 @@ def _maybe_start_embedded_mocks() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    validate_security_settings()  # refuse to start with an empty / default HMAC_SECRET
     init_db()
     _maybe_start_embedded_mocks()
     if not os.getenv("DISABLE_RECOVERY"):

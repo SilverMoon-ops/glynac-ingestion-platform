@@ -1,6 +1,13 @@
 import hashlib
 import hmac
+import os
+import secrets
 import time
+
+# The API refuses to start with an empty / default HMAC_SECRET, so tests pin their own. This must happen
+# before `app` is imported (settings are read at import time) and wins over whatever a developer's .env says.
+os.environ["HMAC_SECRET"] = "test-secret-" + "x" * 40
+os.environ["HMAC_CLIENT_ID"] = "test-client"
 
 import pytest
 from fastapi.testclient import TestClient
@@ -65,16 +72,42 @@ def _isolated_storage_and_clickhouse(tmp_path, monkeypatch):
     clickhouse_module._sink_instance = None
 
 
+class SigningTestClient(TestClient):
+    """TestClient that signs requests marked by `sign_request()` at the moment they are sent.
+
+    The signature covers method, path and body, which a header-only helper cannot know in advance, so the
+    real values are read from the outgoing request here. The canonical string is rebuilt from scratch
+    below (not imported from app.security) so the tests check the server against an independent
+    implementation of the documented format.
+    """
+
+    def send(self, request, **kwargs):
+        if request.headers.get("X-Test-Sign"):
+            del request.headers["X-Test-Sign"]
+            request.headers.update(signed_headers(request.method, request.url.raw_path.decode(), request.content))
+        return super().send(request, **kwargs)
+
+
+def signed_headers(method: str, target: str, body: bytes = b"", *, secret=None, client_id=None,
+                   timestamp=None, nonce=None) -> dict:
+    """Headers for one signed request. `target` is the path plus ?query exactly as sent."""
+    secret = settings.hmac_secret if secret is None else secret
+    client_id = settings.hmac_client_id if client_id is None else client_id
+    timestamp = str(int(time.time())) if timestamp is None else str(timestamp)
+    nonce = secrets.token_hex(16) if nonce is None else nonce
+    message = "\n".join([method.upper(), target, timestamp, nonce, client_id, hashlib.sha256(body).hexdigest()])
+    signature = hmac.new(secret.encode(), message.encode(), hashlib.sha256).hexdigest()
+    return {"X-Client-Id": client_id, "X-Timestamp": timestamp, "X-Nonce": nonce, "X-Signature": signature}
+
+
 @pytest.fixture()
 def client(db_session):
-    return TestClient(app)
+    return SigningTestClient(app)
 
 
 def sign_request(body: bytes = b"") -> dict:
-    """Build valid X-Timestamp / X-Signature headers for the test HMAC secret."""
-    ts = str(int(time.time()))
-    sig = hmac.new(settings.hmac_secret.encode(), ts.encode() + body, hashlib.sha256).hexdigest()
-    return {"X-Timestamp": ts, "X-Signature": sig}
+    """Mark a request to be signed (valid headers for its real method, path and body) when sent."""
+    return {"X-Test-Sign": "1"}
 
 
 # ── Mock services: a real HTTP server, started once per test session ────────────

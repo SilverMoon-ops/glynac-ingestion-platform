@@ -1,33 +1,41 @@
 # sign.py — HMAC signing CLI & operations runner
 import hmac, hashlib, time, sys, json, urllib.request, urllib.error
-import os
+import os, secrets
 from pathlib import Path
 
-# ── Read secret from .env so this always matches the server ──────────────────
-env_file = Path(__file__).parent / ".env"
-SECRET = os.getenv("HMAC_SECRET", "")   # never hardcode the real secret in source
-if env_file.exists():
-    for line in env_file.read_text().splitlines():
-        line = line.strip()
-        if line.startswith("HMAC_SECRET"):
-            SECRET = line.split("=", 1)[1].strip().strip('"').strip("'")
-            break
+# ── Read secret and client id from .env so this always matches the server ────
+def _env_value(name: str) -> str:
+    value = os.getenv(name, "")
+    env_file = Path(__file__).parent / ".env"
+    if env_file.exists():
+        for line in env_file.read_text().splitlines():
+            line = line.strip()
+            if line.startswith(name + "="):
+                value = line.split("=", 1)[1].strip().strip('"').strip("'")
+                break
+    return value
+
+SECRET = _env_value("HMAC_SECRET")   # never hardcode the real secret in source
+CLIENT_ID = _env_value("HMAC_CLIENT_ID") or "glynac-client"
 
 if not SECRET:
     sys.exit("HMAC_SECRET is not set. Put it in .env (the same value the server uses) or export it.")
 
 BASE = os.getenv("API_BASE_URL", "http://localhost:8000")
 
-def sign(body: bytes = b""):
-    ts  = str(int(time.time()))
-    # Must match security.py exactly: timestamp.encode() + body  (byte concat)
-    msg = ts.encode() + body
-    sig = hmac.new(SECRET.encode(), msg, hashlib.sha256).hexdigest()
-    return {"X-Timestamp": ts, "X-Signature": sig, "Content-Type": "application/json"}
+def sign(method: str, path: str, body: bytes = b""):
+    """Headers for one request. Must match app/security.py canonical_string():
+    METHOD \\n PATH[?QUERY] \\n TIMESTAMP \\n NONCE \\n CLIENT_ID \\n sha256(body)   (path exactly as sent)."""
+    ts = str(int(time.time()))
+    nonce = secrets.token_hex(16)  # single use: the server rejects a repeated nonce
+    msg = "\n".join([method.upper(), path, ts, nonce, CLIENT_ID, hashlib.sha256(body).hexdigest()])
+    sig = hmac.new(SECRET.encode(), msg.encode(), hashlib.sha256).hexdigest()
+    return {"X-Client-Id": CLIENT_ID, "X-Timestamp": ts, "X-Nonce": nonce, "X-Signature": sig,
+            "Content-Type": "application/json"}
 
 def post(path, payload: dict = {}):
     body = json.dumps(payload).encode()
-    req  = urllib.request.Request(BASE + path, data=body, headers=sign(body), method="POST")
+    req  = urllib.request.Request(BASE + path, data=body, headers=sign("POST", path, body), method="POST")
     try:
         resp = urllib.request.urlopen(req)
         print(json.dumps(json.loads(resp.read()), indent=2))
@@ -35,7 +43,7 @@ def post(path, payload: dict = {}):
         print("ERROR", e.code, e.read().decode())
 
 def get(path):
-    req  = urllib.request.Request(BASE + path, headers=sign(b""), method="GET")
+    req  = urllib.request.Request(BASE + path, headers=sign("GET", path), method="GET")
     try:
         resp = urllib.request.urlopen(req)
         print(json.dumps(json.loads(resp.read()), indent=2))
@@ -81,7 +89,7 @@ elif cmd == "hs-pause-demo":
     # 1. Start the job
     print("▶  STEP 1: Starting job...")
     body = json.dumps({"object_name": object_name, "org_id": "org1"}).encode()
-    req  = urllib.request.Request(BASE + "/api/hubspot/start", data=body, headers=sign(body), method="POST")
+    req  = urllib.request.Request(BASE + "/api/hubspot/start", data=body, headers=sign("POST", "/api/hubspot/start", body), method="POST")
     resp = urllib.request.urlopen(req)
     job  = json.loads(resp.read())
     job_id = job["id"]
@@ -108,7 +116,7 @@ elif cmd == "hs-pause-demo":
     print("\n⏳ STEP 6: Waiting for completion...")
     for _ in range(25):
         _time.sleep(0.5)
-        req2  = urllib.request.Request(BASE + f"/api/hubspot/status/{job_id}", headers=sign(b""), method="GET")
+        req2  = urllib.request.Request(BASE + f"/api/hubspot/status/{job_id}", headers=sign("GET", f"/api/hubspot/status/{job_id}"), method="GET")
         resp2 = urllib.request.urlopen(req2)
         status_data = json.loads(resp2.read())
         if status_data["status"] in ("COMPLETED", "FAILED", "CANCELLED"):

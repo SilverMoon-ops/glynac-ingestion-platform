@@ -7,7 +7,11 @@ load_dotenv()
 class Settings:
     """Central place for config so nothing is hardcoded in route handlers."""
 
-    hmac_secret: str = os.getenv("HMAC_SECRET", "dev-secret-do-not-use-in-prod")
+    # No fallback: an unset / empty / placeholder secret is rejected at startup (app/security.py),
+    # because HMAC with an empty key is trivially forgeable.
+    hmac_secret: str = os.getenv("HMAC_SECRET", "")
+    # Identifies the calling client; part of the signed string and sent as X-Client-Id.
+    hmac_client_id: str = os.getenv("HMAC_CLIENT_ID", "glynac-client")
     database_url: str = os.getenv("DATABASE_URL", "sqlite:///./glynac.db")
     signature_max_age_seconds: int = int(os.getenv("SIGNATURE_MAX_AGE_SECONDS", "300"))
 

@@ -89,7 +89,18 @@ The compose file uses `latest` for MinIO and ClickHouse. Once it works for you, 
 ### Authentication
 
 * **Web console:** `POST /api/auth/login` with `UI_PASSWORD` sets an `HttpOnly`, `SameSite=Strict` session cookie. The browser never holds the HMAC secret.
-* **Scripts and other services:** every `/api/*` request is signed: `X-Timestamp` and `X-Signature = HMAC-SHA256(HMAC_SECRET, timestamp + body)`, valid for 5 minutes. `sign.py` does this for you (reads `HMAC_SECRET` from `.env`):
+* **Scripts and other services:** every `/api/*` request is signed with four headers: `X-Client-Id` (must equal `HMAC_CLIENT_ID`), `X-Timestamp` (unix seconds, valid for 5 minutes), `X-Nonce` (16-128 chars, single use) and `X-Signature`, the hex `HMAC-SHA256(HMAC_SECRET, canonical)` where `canonical` is six lines joined by `\n`:
+
+  ```
+  METHOD                 upper-case, e.g. POST
+  PATH[?QUERY]           exactly as sent, e.g. /api/jobs?service=hubspot
+  TIMESTAMP              same value as X-Timestamp
+  NONCE                  same value as X-Nonce
+  CLIENT_ID              same value as X-Client-Id
+  SHA256_HEX(BODY)       lower-case hex of the raw body (empty body = sha256 of nothing)
+  ```
+
+  A signature is only valid for the method, path, query and body it was made for, and a nonce can be used once (replays get 401; used nonces are kept in the `used_nonces` table). The API **will not start** if `HMAC_SECRET` is empty or still the old development default. `sign.py` does all of this for you (reads `HMAC_SECRET` and `HMAC_CLIENT_ID` from `.env`):
 
 ```bash
 python sign.py sf Accounts          # start a Salesforce sync
@@ -109,7 +120,9 @@ All settings are environment variables (see `.env.example`).
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `HMAC_SECRET` | dev value | Secret for signed API requests and console sessions. **Change it.** |
+| `HMAC_SECRET` | none (required) | Secret for signed API requests and console sessions. The API refuses to start if it is empty or the old dev default. |
+| `HMAC_CLIENT_ID` | `glynac-client` | Client id sent as `X-Client-Id` and included in every signature |
+| `RATE_LIMIT_MAX_WAIT_SECONDS` / `RATE_LIMIT_TOTAL_WAIT_SECONDS` | 300 / 900 | Longest single `Retry-After` we will wait, and the total 429 waiting per call (429s are not counted against the 5 attempts) |
 | `UI_PASSWORD` | empty | Console password. Empty disables console login. |
 | `DATABASE_URL` | `sqlite:///./glynac.db` | Job, checkpoint, audit and dead-letter state |
 | `STORAGE_BACKEND` | `minio` | `minio` or `local` (files under `LOCAL_STORAGE_ROOT`) |

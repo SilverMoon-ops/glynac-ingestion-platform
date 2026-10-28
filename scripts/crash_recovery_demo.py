@@ -39,6 +39,7 @@ work = tempfile.mkdtemp(prefix="glynac-crash-demo-")
 api_port, mock_port = free_port(), free_port()
 env = dict(
     os.environ,
+    HMAC_SECRET=os.urandom(32).hex(),  # the API refuses to start without one
     DATABASE_URL=f"sqlite:///{work}/demo.db", STORAGE_BACKEND="local", LOCAL_STORAGE_ROOT=f"{work}/objects",
     DLT_PIPELINES_DIR=f"{work}/dlt", CLICKHOUSE_ENABLED="false", UI_PASSWORD=PASSWORD,
     MOCK_SERVICES_URL="", MOCK_SERVICES_PORT=str(mock_port),
