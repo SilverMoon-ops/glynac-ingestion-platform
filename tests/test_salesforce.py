@@ -97,3 +97,26 @@ def test_start_endpoint_rejects_unsupported_object(client):
     headers = {**sign_request(payload), "Content-Type": "application/json"}
     res = client.post("/api/salesforce/start", headers=headers, content=payload)
     assert res.status_code == 400
+
+
+def test_rate_limit_that_outlasts_retries_fails_the_job_instead_of_leaving_it_running(db_session, monkeypatch):
+    from app import retry
+    from app.models import AuditLog
+    from app.salesforce.real_client import SalesforceRateLimitError
+
+    monkeypatch.setattr(retry, "_sleep", lambda s: None)
+
+    class AlwaysRateLimited(MockSalesforceClient):
+        def get_job_status(self, job_id):
+            # Retry-After far beyond the cap: the retry layer gives up and re-raises the 429
+            raise SalesforceRateLimitError("429 Too Many Requests, Retry-After 99999s", 99999)
+
+    job = create_job(db_session, service="salesforce", object_name="Accounts")
+    run_salesforce_ingestion(job.id, "Accounts", org_id="org1", client=AlwaysRateLimited(polls_to_complete=1))
+
+    db_session.expire_all()
+    refreshed = db_session.query(Job).filter(Job.id == job.id).first()
+    assert refreshed.status == JobStatus.FAILED.value  # not RUNNING
+    assert "429" in refreshed.error
+    actions = [a.event for a in db_session.query(AuditLog).filter(AuditLog.job_id == job.id).all()]
+    assert "RATE_LIMITED" in actions

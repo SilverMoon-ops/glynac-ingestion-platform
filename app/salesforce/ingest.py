@@ -189,24 +189,20 @@ def run_salesforce_ingestion(
             detail=f"landed {len(valid_records)} rows at {path}, {len(invalid_records)} sent to dead-letter",
         )
         
-    except SalesforceRateLimitError as exc:
-        # Retry this whole job later
-        job = get_job_or_404(db, job_id)
-        job.retry_count += 1
-        db.add(job)
-        db.commit()
-        log_audit(db, job.id, "RATE_LIMITED", detail=str(exc))
-        raise
-        
     except Exception as exc:
+        # Every failure ends the job in FAILED (with the reason in job.error), including a 429 that
+        # outlasted the retry policy. Re-raising here used to leave the job RUNNING forever,
+        # because this runs in a background thread where nobody catches the exception.
         job = get_job_or_404(db, job_id)
         job.retry_count += 1
         db.add(job)
         db.commit()
-        log_audit(db, job.id, "ERROR", detail=str(exc))
+        rate_limited = isinstance(exc, SalesforceRateLimitError)
+        log_audit(db, job.id, "RATE_LIMITED" if rate_limited else "ERROR", detail=str(exc))
         try:
             transition(db, job, JobStatus.FAILED, detail=str(exc))
         except Exception:
             pass
+
     finally:
         db.close()
