@@ -12,7 +12,7 @@ from typing import Optional
 
 import requests
 
-from app.errors import TransientError
+from app.errors import RateLimitError, TransientError, parse_retry_after
 from app.hubspot.schemas import HUBSPOT_SCHEMAS
 
 # HubSpot object-type names for each of our resources.
@@ -52,12 +52,8 @@ class HubSpotAPIError(HubSpotError):
     pass
 
 
-class HubSpotRateLimitError(TransientError):
+class HubSpotRateLimitError(RateLimitError):
     """HTTP 429. Carries the server's Retry-After hint."""
-
-    def __init__(self, message: str = "rate limited (429)", retry_after_seconds: int = 2):
-        self.retry_after_seconds = retry_after_seconds
-        super().__init__(message)
 
 
 class HubSpotServerError(TransientError):
@@ -69,8 +65,9 @@ def _raise_for_status(resp: requests.Response, what: str) -> None:
         return
     detail = resp.text[:300]
     if resp.status_code == 429:
-        retry_after = int(resp.headers.get("Retry-After", "2") or 2)
-        raise HubSpotRateLimitError(f"{what}: rate limited (429, Retry-After {retry_after}s)", retry_after)
+        retry_after = parse_retry_after(resp.headers.get("Retry-After"))
+        hint = f", Retry-After {retry_after:g}s" if retry_after is not None else ""
+        raise HubSpotRateLimitError(f"{what}: rate limited (429{hint})", retry_after)
     if resp.status_code >= 500:
         raise HubSpotServerError(f"{what}: server error {resp.status_code} {detail}")
     if resp.status_code in (401, 403):

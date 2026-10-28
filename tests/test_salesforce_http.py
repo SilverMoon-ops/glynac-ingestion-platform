@@ -61,7 +61,7 @@ def test_http_429_is_retried_with_backoff(db_session, mock_services, capsys):
     mock_services.salesforce(polls_to_complete=1, fail_status_with_429=1)
     started = time.time()
     job = _run(db_session)
-    assert "[RETRY] attempt 1 failed (SalesforceRateLimitError" in capsys.readouterr().out  # visible in the logs
+    assert "rate limited (429, Retry-After 1s)" in capsys.readouterr().out  # visible in the logs
     assert job.status == JobStatus.COMPLETED.value
     assert [r for r in mock_services.salesforce_requests() if r == "GET status"].__len__() >= 2
     assert time.time() - started >= 1  # it actually waited before retrying

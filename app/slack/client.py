@@ -12,7 +12,7 @@ from typing import Optional
 
 import requests
 
-from app.errors import TransientError
+from app.errors import RateLimitError, TransientError, parse_retry_after
 
 _AUTH_ERRORS = {"invalid_auth", "not_authed", "token_revoked", "account_inactive", "token_expired"}
 
@@ -29,10 +29,8 @@ class SlackAPIError(SlackError):
     pass
 
 
-class SlackRateLimitError(TransientError):
-    def __init__(self, message: str = "rate limited", retry_after_seconds: int = 1):
-        self.retry_after_seconds = retry_after_seconds
-        super().__init__(message)
+class SlackRateLimitError(RateLimitError):
+    pass
 
 
 class SlackServerError(TransientError):
@@ -52,8 +50,9 @@ class SlackClient:
             timeout=30,
         )
         if resp.status_code == 429:
-            retry_after = int(resp.headers.get("Retry-After", "1") or 1)
-            raise SlackRateLimitError(f"{method}: rate limited (429, Retry-After {retry_after}s)", retry_after)
+            retry_after = parse_retry_after(resp.headers.get("Retry-After"))
+            hint = f", Retry-After {retry_after:g}s" if retry_after is not None else ""
+            raise SlackRateLimitError(f"{method}: rate limited (429{hint})", retry_after)
         if resp.status_code >= 500:
             raise SlackServerError(f"{method}: server error {resp.status_code}")
         if resp.status_code >= 400:

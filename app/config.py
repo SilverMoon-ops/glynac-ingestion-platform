@@ -48,6 +48,11 @@ class Settings:
     salesforce_results_page_size: int = int(os.getenv("SALESFORCE_RESULTS_PAGE_SIZE", "1000"))
     salesforce_mock_enabled: bool = os.getenv("SALESFORCE_MOCK_ENABLED", "true").lower() == "true"
 
+    # 429 handling: wait the server's Retry-After, never counted against the 5 attempts.
+    # These two bounds stop a server that answers 429 forever from stalling a job forever.
+    rate_limit_max_wait_seconds: float = float(os.getenv("RATE_LIMIT_MAX_WAIT_SECONDS", "300"))      # longest single Retry-After we will honour
+    rate_limit_total_wait_seconds: float = float(os.getenv("RATE_LIMIT_TOTAL_WAIT_SECONDS", "900"))  # total waiting per call
+
     dlt_pipelines_dir: str = os.getenv("DLT_PIPELINES_DIR", "./.dlt_pipelines")
 
         # HubSpot real API (optional)

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import requests
 
-from app.errors import TransientError
+from app.errors import RateLimitError, TransientError, parse_retry_after
 
 
 class SalesforceError(Exception):
@@ -25,8 +25,8 @@ class SalesforceAPIError(SalesforceError):
     pass
 
 
-class SalesforceRateLimitError(TransientError):
-    """HTTP 429."""
+class SalesforceRateLimitError(RateLimitError):
+    """HTTP 429. Carries the server's Retry-After (seconds) when it sent one."""
 
 
 class SalesforceServerError(TransientError):
@@ -41,7 +41,9 @@ def _raise_for_status(resp: requests.Response, what: str) -> None:
         return
     detail = resp.text[:300]
     if resp.status_code == 429:
-        raise SalesforceRateLimitError(f"{what}: rate limited (429) {detail}")
+        retry_after = parse_retry_after(resp.headers.get("Retry-After"))
+        hint = f", Retry-After {retry_after:g}s" if retry_after is not None else ""
+        raise SalesforceRateLimitError(f"{what}: rate limited (429{hint}) {detail}", retry_after)
     if resp.status_code >= 500:
         raise SalesforceServerError(f"{what}: server error {resp.status_code} {detail}")
     if resp.status_code in (400, 401, 403) and "oauth2/token" in resp.url:
