@@ -2,6 +2,7 @@
 HubSpot ingestion over real HTTP: the production client talks to the standalone
 mock server (mock_services/), exactly as it would talk to api.hubapi.com.
 """
+from datetime import datetime, timedelta, timezone
 import json
 import time
 
@@ -108,6 +109,7 @@ def test_crash_then_recovery_over_http_gives_the_same_records_no_duplicates(db_s
     crashed = db_session.query(Job).get(job.id)
     assert crashed.row_count == 20 and json.loads(crashed.cursor)["resume_cursor"] == "20"
     crashed.owner = "dead-process"
+    crashed.heartbeat_at = datetime.now(timezone.utc) - timedelta(hours=1)  # it stopped stamping heartbeats
     db_session.add(crashed)
     db_session.commit()
 

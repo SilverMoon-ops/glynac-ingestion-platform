@@ -4,6 +4,7 @@ Real-time Slack: pause, buffering, resume, catch-up from per-channel high-water 
 Slack has already been answered "200 OK" by the time an event is processed, so an event that
 cannot be ingested now (stream paused, ClickHouse down, server down) must be kept, not dropped.
 """
+from datetime import datetime, timedelta, timezone
 import json
 import time
 
@@ -184,6 +185,7 @@ def test_crash_recovery_of_a_realtime_stream_drains_the_buffer_and_catches_up(db
     mock_services.slack(messages_per_channel=20)
     job = _running(db_session)
     job.owner = "dead-process"  # the process that was running the stream was killed
+    job.heartbeat_at = datetime.now(timezone.utc) - timedelta(hours=1)
     db_session.add(job)
     db_session.commit()
     buffer_event(db_session, "org1", {"id": "C003:17000000020.000100", "channel_id": "C003", "user_id": "U001",

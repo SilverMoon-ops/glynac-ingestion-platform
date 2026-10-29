@@ -2,6 +2,7 @@
 Slack ingestion over real HTTP: the production Web API client talks to the standalone
 mock server, and real-time messages arrive as signed Events API webhooks.
 """
+from datetime import datetime, timedelta, timezone
 import json
 import time
 
@@ -123,6 +124,7 @@ def test_crash_after_every_channel_finished_is_finalised_not_redone(db_session, 
     run_historical_backfill(job.id, "org1", page_size=5)
     j = _reload(db_session, job)
     j.status, j.owner = JobStatus.RUNNING.value, "dead-process"  # died just before COMPLETED
+    j.heartbeat_at = datetime.now(timezone.utc) - timedelta(hours=1)
     db_session.add(j)
     db_session.commit()
 

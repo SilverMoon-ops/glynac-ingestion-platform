@@ -10,6 +10,12 @@ from app.storage import get_storage
 from tests.conftest import sign_request
 
 
+def _long_ago():
+    from datetime import datetime, timedelta, timezone
+
+    return datetime.now(timezone.utc) - timedelta(hours=1)
+
+
 def _orphan(db, service, obj, **kw):
     """A job a previous (now dead) process left RUNNING."""
     job = create_job(db, service=service, object_name=obj, org_id="org1")
@@ -141,7 +147,8 @@ def test_midrun_crash_resumes_from_last_page_without_double_counting(db_session,
     landed_before = set(get_storage().list_objects("hubspot/"))
     assert len(landed_before) == 2  # the two finished pages are already in storage
 
-    crashed.owner = "dead-process"  # it belonged to the process that died
+    crashed.owner = "dead-process"  # it belonged to the process that died...
+    crashed.heartbeat_at = _long_ago()  # ...which has not stamped a heartbeat since
     db_session.add(crashed)
     db_session.commit()
     assert recover_interrupted_jobs(dispatch=lambda fn: fn()) == [job.id]
@@ -161,6 +168,7 @@ def test_crash_after_last_page_checkpoint_is_finalised_not_rerun(db_session, mon
     db_session.expire_all()
     j = db_session.query(Job).get(job.id)
     j.status, j.owner = JobStatus.RUNNING.value, "dead-process"  # died just before COMPLETED
+    j.heartbeat_at = _long_ago()
     db_session.add(j)
     db_session.commit()
 

@@ -11,10 +11,11 @@ from __future__ import annotations
 
 import os
 import uuid
+from datetime import datetime, timezone
 from typing import Optional
 
 from app.database import SessionLocal
-from app.models import Job
+from app.models import Job, JobStatus
 
 # Unique per process start. A job whose owner differs from this value was being
 # run by a process that no longer exists (single-instance deployment assumed).
@@ -56,7 +57,30 @@ def claim_job(job_id: str) -> None:
         job = db.query(Job).filter(Job.id == job_id).first()
         if job is not None:
             job.owner = BOOT_ID
+            job.heartbeat_at = datetime.now(timezone.utc)
             db.add(job)
             db.commit()
+    finally:
+        db.close()
+
+
+def heartbeat_once() -> int:
+    """Stamp every RUNNING job this process owns as alive. Returns how many jobs were stamped.
+
+    Other processes read `heartbeat_at` to tell "owner is busy" from "owner is dead" (app/recovery.py).
+    `updated_at` is deliberately left alone so heartbeats do not look like job progress in the UI.
+    """
+    db = SessionLocal()
+    try:
+        n = (
+            db.query(Job)
+            .filter(Job.owner == BOOT_ID, Job.status == JobStatus.RUNNING.value)
+            .update(
+                {Job.heartbeat_at: datetime.now(timezone.utc), Job.updated_at: Job.updated_at},
+                synchronize_session=False,
+            )
+        )
+        db.commit()
+        return n
     finally:
         db.close()

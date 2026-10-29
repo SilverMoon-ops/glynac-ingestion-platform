@@ -2,6 +2,7 @@
 Incremental HubSpot sync: after one completed run, later runs ask only for records modified
 since the stored `updated_at` high-water mark (via the CRM search endpoint).
 """
+from datetime import datetime, timedelta, timezone
 import json
 
 import pytest
@@ -140,6 +141,7 @@ def test_mark_moves_only_when_a_run_completes_and_a_crashed_run_resumes_with_the
     assert get_high_water(db_session, "hubspot", "org1", "Deals") == mark_before  # NOT advanced mid-run
 
     crashed.owner = "dead-process"
+    crashed.heartbeat_at = datetime.now(timezone.utc) - timedelta(hours=1)  # it stopped stamping heartbeats
     db_session.add(crashed)
     db_session.commit()
     assert recover_interrupted_jobs(dispatch=lambda fn: fn()) == [job.id]

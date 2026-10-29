@@ -54,7 +54,7 @@ def _ensure_columns():
     from sqlalchemy import inspect, text
 
     wanted = {
-        "jobs": {"control": "VARCHAR", "owner": "VARCHAR"},
+        "jobs": {"control": "VARCHAR", "owner": "VARCHAR", "heartbeat_at": "DATETIME"},
         "channel_checkpoint": {"completed": "BOOLEAN NOT NULL DEFAULT 0"},
     }
     inspector = inspect(engine)

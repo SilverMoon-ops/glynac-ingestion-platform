@@ -123,6 +123,7 @@ All settings are environment variables (see `.env.example`).
 | `HMAC_SECRET` | none (required) | Secret for signed API requests and console sessions. The API refuses to start if it is empty or the old dev default. |
 | `HMAC_CLIENT_ID` | `glynac-client` | Client id sent as `X-Client-Id` and included in every signature |
 | `RATE_LIMIT_MAX_WAIT_SECONDS` / `RATE_LIMIT_TOTAL_WAIT_SECONDS` | 300 / 900 | Longest single `Retry-After` we will wait, and the total 429 waiting per call (429s are not counted against the 5 attempts) |
+| `HEARTBEAT_INTERVAL_SECONDS` / `HEARTBEAT_TIMEOUT_SECONDS` | 5 / 30 | Each instance stamps its running jobs every interval; a job silent for the timeout is adopted by another instance (or by this one after a restart). Timeout must be >= 3x interval |
 | `UI_PASSWORD` | empty | Console password. Empty disables console login. |
 | `DATABASE_URL` | `sqlite:///./glynac.db` | Job, checkpoint, audit and dead-letter state |
 | `STORAGE_BACKEND` | `minio` | `minio` or `local` (files under `LOCAL_STORAGE_ROOT`) |

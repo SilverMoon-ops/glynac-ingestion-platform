@@ -10,7 +10,7 @@ How each requirement of the task brief (BE-1, BE-2, BE-3) is met, and **how that
 | **Real ClickHouse** | The production ClickHouse code runs against the actual ClickHouse engine (`chdb`, embedded; version `26.9`) reading files from an S3-compatible server (`moto`) with the `s3()` table function. Not Docker, not MinIO itself. |
 | **Process kill** | The API runs as a separate OS process and is killed with `SIGKILL`. |
 
-**Test suite: 167 tests, all passing** (`pytest -q`, about 2 minutes).
+**Test suite: 190 tests passing** with `pytest -q --ignore=tests/test_clickhouse_real.py` (about 2.5 minutes). The 28 real-ClickHouse tests in `test_clickhouse_real.py` need `chdb` and `moto` (`requirements-dev.txt`) and **were not re-run after defects 41-45 below**; run the full `pytest -q` on your machine before relying on this report. Added since the previous revision: `test_retry.py` (12), HMAC tests in `test_auth.py` (+26), one rate-limit test in `test_salesforce.py`, `test_heartbeat.py` (11), `test_multi_instance.py` (1, two real processes and a `kill -9`).
 
 | File | Tests | Covers |
 |---|---:|---|
@@ -167,6 +167,11 @@ Each is covered by a test or by the process-kill script.
 | 38 | Why the test suite missed 37: the real-ClickHouse test client had a lock that serialised everything | The bug was invisible to every test | The harness client now behaves like the real one (one query at a time per client); the smoke script runs inside the test suite against the real API, real engine and S3 storage |
 | 39 | The table inspector counted raw rows and all organisations (it showed `bronze_salesforce_accounts has 450 rows` for 30 records) | Misleading numbers in the console and the smoke test | `SELECT count() ... FINAL`, with an optional `org_id` filter; the console passes the job's organisation |
 | 40 | The smoke test printed "COMPLETED" for jobs that had failed, reused one organisation (old or partial data polluted it) and only asked for "more than 0 rows" | A failing run looked partly successful | Fresh organisation per run, real status shown, each table must hold exactly what its job loaded |
+| 41 | **A 429 was retried like any other failure**: the server's `Retry-After` was ignored (Salesforce never read it; HubSpot and Slack used a fixed default) and each 429 used up one of the 5 attempts | A rate-limited call failed after 5 quick tries instead of waiting as told | `app/retry.py` rewritten: waits exactly `Retry-After` (seconds or HTTP-date), a 429 is **not** counted, other transient errors still get 5 attempts. Bounded by `RATE_LIMIT_MAX_WAIT_SECONDS` (one wait) and `RATE_LIMIT_TOTAL_WAIT_SECONDS` (per call) so a server that always answers 429 cannot stall a job forever. `test_retry.py` |
+| 42 | **A Salesforce job that hit a rate limit stayed `RUNNING` forever**: the 429 handler re-raised from a background thread where nothing catches it | The job never reached a final state | The handler records `RATE_LIMITED` in the audit log and moves the job to `FAILED` like any other error. `test_rate_limit_that_outlasts_retries_fails_the_job_instead_of_leaving_it_running` (fails against the old code) |
+| 43 | **HMAC signed only `timestamp + body`**, and an unset `HMAC_SECRET` (blank in `.env.example`) meant an empty key | A signature for one endpoint was valid for any other within 5 minutes, replays were accepted, and the shipped example configuration signed with an empty key | Signature now covers method, path+query, timestamp, nonce, client id and the body hash (format in the README); nonces are single-use (`used_nonces` table, shared across processes); the API **refuses to start** if `HMAC_SECRET` is empty or the old dev default. Tamper tests for every field, replay, startup refusal, and `sign.py` against a live server |
+| 44 | **Recovery re-ran every `RUNNING` job owned by another process**, including jobs a live second instance was running | Starting a second instance duplicated runs | Heartbeat: each instance stamps its running jobs every 5 s; only jobs silent for 30 s are adopted, by one atomic conditional `UPDATE` so two instances cannot both take the same job; a periodic sweep adopts jobs whose owner dies later. Verified with **two real processes** and a real `kill -9` (`test_multi_instance.py`); the test fails against the old behaviour (instance B takes A's live job) |
+| 45 | Test helpers that "killed" a job by renaming its owner left a fresh heartbeat behind | Under defect 44's rule such a job is correctly considered alive | Those tests (and `sign_request` in `conftest.py`, which now signs at send time) were updated to model a dead process properly: stale heartbeat |
 
 Because the secret was committed in `sign.py` and was in the page, **rotate `HMAC_SECRET`** if this repository was ever shared.
 
@@ -182,7 +187,7 @@ See the README ("Reliability design") for the state machine, checkpoint, recover
 * **The console in a real browser.** The API calls the page makes were exercised, and the page's JavaScript was not run in a browser here.
 * **Incremental sync against real HubSpot.** Verified against the mock's search endpoint (filter, sort, paging); not against the live search index.
 * **Scale and throughput.** Datasets here are tens to hundreds of rows.
-* **Multiple API instances.** Not supported (section 7.6).
+* **Multiple API instances on a shared *server* database.** Heartbeat recovery is verified with two processes sharing one SQLite file on one machine. SQLite is not a network database, so instances on different machines need `DATABASE_URL` pointing at a shared server database (e.g. PostgreSQL); that setup has not been tried, and the Postgres driver is not in `requirements.txt` (section 7.6).
 
 ## 7. Gaps against the brief and known limitations
 
@@ -191,7 +196,7 @@ See the README ("Reliability design") for the state machine, checkpoint, recover
 3. **Real-time landing writes one tiny Parquet file per message.** Correct and idempotent, but a small-files pattern; production would micro-batch.
 4. **HubSpot Owners and Pipelines** use dedicated endpoints and a different response shape in real HubSpot; the client treats all eight uniformly. Real deals need the company association requested to carry `company_id`.
 5. **`v_client_360_deals` joins by company name**; a shared key such as domain would be better in production.
-6. **One API instance only.** Recovery treats any job not owned by the current process as orphaned; state is in SQLite.
+6. **Multiple instances: limits.** Recovery now uses a heartbeat (defect 44), so a second instance no longer re-runs a live instance's jobs, and it adopts a dead instance's jobs. Remaining limits: (a) the state lives in SQLite, which only works for instances on one machine sharing the file; (b) an instance that is frozen for longer than `HEARTBEAT_TIMEOUT_SECONDS` and then wakes up can still be running a job another instance adopted. The duplicate work is harmless (deterministic file names, `ReplacingMergeTree`) but wasteful; the worker does not yet notice it lost ownership.
 7. **Credentials in SQL.** The MinIO keys appear in the load query; use ClickHouse named collections in production.
 8. **Slack resume page size.** Resume uses the default (10); harmless because cursors work for any page size.
 9. **Status labels** are `RUNNING / COMPLETED / FAILED / PAUSED / CANCELLED`, not Salesforce's `InProgress / JobComplete`.

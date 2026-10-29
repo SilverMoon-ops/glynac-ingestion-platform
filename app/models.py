@@ -46,6 +46,7 @@ class Job(Base):
     error = Column(Text, nullable=True)
     control = Column(String, nullable=True)                  # pending pause/cancel request
     owner = Column(String, nullable=True)                    # process instance running the job
+    heartbeat_at = Column(DateTime, nullable=True)           # last time the owner proved it is alive (UTC)
     created_at = Column(DateTime, default=_now)
     updated_at = Column(DateTime, default=_now, onupdate=_now)
 

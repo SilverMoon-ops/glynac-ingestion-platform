@@ -1,4 +1,5 @@
 import os
+import threading
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -7,7 +8,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app.database import init_db
 from app.errors import InfrastructureUnavailable
-from app.recovery import recover_interrupted_jobs
+from app.recovery import recover_interrupted_jobs, start_background_loop, validate_heartbeat_settings
 from app.security import validate_security_settings
 from app.routers import auth, system, jobs, salesforce, hubspot, slack, slack_events, analytics, storage_browser
 
@@ -34,9 +35,15 @@ async def lifespan(app: FastAPI):
     validate_security_settings()  # refuse to start with an empty / default HMAC_SECRET
     init_db()
     _maybe_start_embedded_mocks()
+    stop = threading.Event()
     if not os.getenv("DISABLE_RECOVERY"):
-        recover_interrupted_jobs()
-    yield
+        validate_heartbeat_settings()
+        recover_interrupted_jobs()      # jobs whose owner has been silent longer than the heartbeat timeout
+        start_background_loop(stop)     # keep our own jobs' heartbeat fresh; adopt jobs of instances that die later
+    try:
+        yield
+    finally:
+        stop.set()
 
 
 app = FastAPI(

@@ -57,6 +57,11 @@ class Settings:
     rate_limit_max_wait_seconds: float = float(os.getenv("RATE_LIMIT_MAX_WAIT_SECONDS", "300"))      # longest single Retry-After we will honour
     rate_limit_total_wait_seconds: float = float(os.getenv("RATE_LIMIT_TOTAL_WAIT_SECONDS", "900"))  # total waiting per call
 
+    # Job heartbeat. Every API process stamps the jobs it runs every INTERVAL seconds; a job whose owner has not
+    # stamped it for TIMEOUT seconds is orphaned and may be taken over by another (or the restarted) process.
+    heartbeat_interval_seconds: float = float(os.getenv("HEARTBEAT_INTERVAL_SECONDS", "5"))
+    heartbeat_timeout_seconds: float = float(os.getenv("HEARTBEAT_TIMEOUT_SECONDS", "30"))
+
     dlt_pipelines_dir: str = os.getenv("DLT_PIPELINES_DIR", "./.dlt_pipelines")
 
         # HubSpot real API (optional)
